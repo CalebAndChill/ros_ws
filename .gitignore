@@ -1,0 +1,19 @@
+build/
+install/
+log/
+.colcon/
+colcon*.log
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.venv/
+.env/
+# models (remove if using Git LFS instead)
+Models/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.engine
+*.bin
