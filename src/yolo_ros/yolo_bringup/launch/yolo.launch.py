@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
+import os
 from launch import LaunchDescription, LaunchContext
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -214,6 +214,14 @@ def generate_launch_description():
             description="Whether to activate the debug node",
         )
 
+        # NEW: classes (text prompts)
+        classes = LaunchConfiguration("classes")
+        classes_cmd = DeclareLaunchArgument(
+            "classes",
+            default_value="['__dummy__']",
+            description="Open-vocabulary class prompts for YOLO-E/YOLO-World (YAML list or string array, e.g. \"['mug','bottle']\")",
+        )
+
         # get topics for remap
         detect_3d_detections_topic = "detections"
         debug_detections_topic = "detections"
@@ -231,6 +239,7 @@ def generate_launch_description():
             executable="yolo_node",
             name="yolo_node",
             namespace=namespace,
+            cwd=os.path.expanduser("~"), 
             parameters=[
                 {
                     "model_type": model_type,
@@ -248,6 +257,8 @@ def generate_launch_description():
                     "agnostic_nms": agnostic_nms,
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
+                    # NEW: pass classes into the node
+                    "classes": classes,
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -325,6 +336,8 @@ def generate_launch_description():
             maximum_detection_threshold_cmd,
             namespace_cmd,
             use_debug_cmd,
+            # NEW: declare classes arg
+            classes_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

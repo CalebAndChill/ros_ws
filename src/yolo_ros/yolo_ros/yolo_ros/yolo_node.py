@@ -1,18 +1,5 @@
 # Copyright (C) 2023 Miguel Ángel González Santamarta
-
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
+# GPLv3 license
 
 from typing import List, Dict
 from cv_bridge import CvBridge
@@ -25,6 +12,9 @@ from rclpy.qos import QoSReliabilityPolicy
 from rclpy.lifecycle import LifecycleNode
 from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.lifecycle import LifecycleState
+
+from rcl_interfaces.msg import SetParametersResult, ParameterType
+import yaml
 
 import torch
 from ultralytics import YOLO, YOLOWorld, YOLOE
@@ -68,7 +58,15 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("agnostic_nms", False)
         self.declare_parameter("retina_masks", False)
 
+        # ---- TEXT PROMPTS ----
+        # Force STRING_ARRAY by giving a string list default; we strip "__dummy__" later.
+        self.declare_parameter("classes", ["__dummy__"])
+
         self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
+
+        # allow runtime updates to 'classes'
+        self.classes: List[str] = []
+        self.add_on_set_parameters_callback(self._on_params_changed)
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -110,6 +108,21 @@ class YoloNode(LifecycleNode):
             self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
 
+        # ----- parse 'classes' (strip "__dummy__"); accepts string[] or YAML string -----
+        self.classes = []
+        try:
+            pv = self.get_parameter("classes").get_parameter_value()
+            if pv.type == ParameterType.PARAMETER_STRING_ARRAY:
+                lst = list(pv.string_array_value)
+                self.classes = [s for s in lst if s and s != "__dummy__"]
+            elif pv.type == ParameterType.PARAMETER_STRING:
+                s = (pv.string_value or "").strip()
+                if s:
+                    parsed = list(yaml.safe_load(s))
+                    self.classes = [x for x in parsed if x and x != "__dummy__"]
+        except Exception as e:
+            self.get_logger().warn(f"Failed to parse 'classes' param: {e}")
+
         # detection pub
         self.image_qos_profile = QoSProfile(
             reliability=self.reliability,
@@ -143,16 +156,27 @@ class YoloNode(LifecycleNode):
             except TypeError as e:
                 self.get_logger().warn(f"Error while fuse: {e}")
 
+        # services
         self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
 
-        if isinstance(self.yolo, YOLOWorld):
+        # expose SetClasses for YOLOWorld **and** YOLOE
+        if isinstance(self.yolo, (YOLOWorld, YOLOE)):
             self._set_classes_srv = self.create_service(
                 SetClasses, "set_classes", self.set_classes_cb
             )
 
+        # subscriber
         self._sub = self.create_subscription(
             Image, "image_raw", self.image_cb, self.image_qos_profile
         )
+
+        # Apply text prompts if provided
+        try:
+            if isinstance(self.yolo, (YOLOWorld, YOLOE)) and self.classes:
+                self.yolo.set_classes(self.classes)  # YOLOE needs CLIP installed
+                self.get_logger().info(f"Open-vocab classes set: {self.classes}")
+        except Exception as e:
+            self.get_logger().warn(f"set_classes failed: {e}")
 
         super().on_activate(state)
         self.get_logger().info(f"[{self.get_name()}] Activated")
@@ -170,7 +194,7 @@ class YoloNode(LifecycleNode):
         self.destroy_service(self._enable_srv)
         self._enable_srv = None
 
-        if isinstance(self.yolo, YOLOWorld):
+        if hasattr(self, "_set_classes_srv") and self._set_classes_srv is not None:
             self.destroy_service(self._set_classes_srv)
             self._set_classes_srv = None
 
@@ -209,10 +233,10 @@ class YoloNode(LifecycleNode):
         response.success = True
         return response
 
+    # ---------- helpers for publishing ----------
+
     def parse_hypothesis(self, results: Results) -> List[Dict]:
-
         hypothesis_list = []
-
         if results.boxes:
             box_data: Boxes
             for box_data in results.boxes:
@@ -222,7 +246,6 @@ class YoloNode(LifecycleNode):
                     "score": float(box_data.conf),
                 }
                 hypothesis_list.append(hypothesis)
-
         elif results.obb:
             for i in range(results.obb.cls.shape[0]):
                 hypothesis = {
@@ -231,48 +254,33 @@ class YoloNode(LifecycleNode):
                     "score": float(results.obb.conf[i]),
                 }
                 hypothesis_list.append(hypothesis)
-
         return hypothesis_list
 
     def parse_boxes(self, results: Results) -> List[BoundingBox2D]:
-
         boxes_list = []
-
         if results.boxes:
             box_data: Boxes
             for box_data in results.boxes:
-
                 msg = BoundingBox2D()
-
-                # get boxes values
                 box = box_data.xywh[0]
                 msg.center.position.x = float(box[0])
                 msg.center.position.y = float(box[1])
                 msg.size.x = float(box[2])
                 msg.size.y = float(box[3])
-
-                # append msg
                 boxes_list.append(msg)
-
         elif results.obb:
             for i in range(results.obb.cls.shape[0]):
                 msg = BoundingBox2D()
-
-                # get boxes values
                 box = results.obb.xywhr[i]
                 msg.center.position.x = float(box[0])
                 msg.center.position.y = float(box[1])
                 msg.center.theta = float(box[4])
                 msg.size.x = float(box[2])
                 msg.size.y = float(box[3])
-
-                # append msg
                 boxes_list.append(msg)
-
         return boxes_list
 
     def parse_masks(self, results: Results) -> List[Mask]:
-
         masks_list = []
 
         def create_point2d(x: float, y: float) -> Point2D:
@@ -283,110 +291,93 @@ class YoloNode(LifecycleNode):
 
         mask: Masks
         for mask in results.masks:
-
             msg = Mask()
-
             msg.data = [
                 create_point2d(float(ele[0]), float(ele[1]))
                 for ele in mask.xy[0].tolist()
             ]
             msg.height = results.orig_img.shape[0]
             msg.width = results.orig_img.shape[1]
-
             masks_list.append(msg)
 
         return masks_list
 
     def parse_keypoints(self, results: Results) -> List[KeyPoint2DArray]:
-
         keypoints_list = []
-
         points: Keypoints
         for points in results.keypoints:
-
             msg_array = KeyPoint2DArray()
-
             if points.conf is None:
                 continue
-
             for kp_id, (p, conf) in enumerate(zip(points.xy[0], points.conf[0])):
-
                 if conf >= self.threshold:
                     msg = KeyPoint2D()
-
                     msg.id = kp_id + 1
                     msg.point.x = float(p[0])
                     msg.point.y = float(p[1])
                     msg.score = float(conf)
-
                     msg_array.data.append(msg)
-
             keypoints_list.append(msg_array)
-
         return keypoints_list
 
+    # ---------- main callback ----------
+
     def image_cb(self, msg: Image) -> None:
+        if not self.enable:
+            return
 
-        if self.enable:
+        # convert image + predict
+        cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding=self.yolo_encoding)
+        results = self.yolo.predict(
+            source=cv_image,
+            verbose=False,
+            stream=False,
+            conf=self.threshold,
+            iou=self.iou,
+            imgsz=(self.imgsz_height, self.imgsz_width),
+            half=self.half,
+            max_det=self.max_det,
+            augment=self.augment,
+            agnostic_nms=self.agnostic_nms,
+            retina_masks=self.retina_masks,
+            device=self.device,
+        )
+        results: Results = results[0].cpu()
 
-            # convert image + predict
-            cv_image = self.cv_bridge.imgmsg_to_cv2(
-                msg, desired_encoding=self.yolo_encoding
-            )
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                conf=self.threshold,
-                iou=self.iou,
-                imgsz=(self.imgsz_height, self.imgsz_width),
-                half=self.half,
-                max_det=self.max_det,
-                augment=self.augment,
-                agnostic_nms=self.agnostic_nms,
-                retina_masks=self.retina_masks,
-                device=self.device,
-            )
-            results: Results = results[0].cpu()
+        if results.boxes or results.obb:
+            hypothesis = self.parse_hypothesis(results)
+            boxes = self.parse_boxes(results)
+        else:
+            hypothesis, boxes = [], []
 
-            if results.boxes or results.obb:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
+        masks = self.parse_masks(results) if results.masks else []
+        keypoints = self.parse_keypoints(results) if results.keypoints else []
 
-            if results.masks:
-                masks = self.parse_masks(results)
+        detections_msg = DetectionArray()
+        for i in range(len(results)):
+            aux_msg = Detection()
 
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
+            if (results.boxes or results.obb) and hypothesis and boxes:
+                aux_msg.class_id = hypothesis[i]["class_id"]
+                aux_msg.class_name = hypothesis[i]["class_name"]
+                aux_msg.score = hypothesis[i]["score"]
+                aux_msg.bbox = boxes[i]
 
-            # create detection msgs
-            detections_msg = DetectionArray()
+            if results.masks and masks:
+                aux_msg.mask = masks[i]
 
-            for i in range(len(results)):
+            if results.keypoints and keypoints:
+                aux_msg.keypoints = keypoints[i]
 
-                aux_msg = Detection()
+            detections_msg.detections.append(aux_msg)
 
-                if results.boxes or results.obb and hypothesis and boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
+        detections_msg.header = msg.header
+        self._pub.publish(detections_msg)
 
-                    aux_msg.bbox = boxes[i]
+        del results
+        del cv_image
 
-                if results.masks and masks:
-                    aux_msg.mask = masks[i]
-
-                if results.keypoints and keypoints:
-                    aux_msg.keypoints = keypoints[i]
-
-                detections_msg.detections.append(aux_msg)
-
-            # publish detections
-            detections_msg.header = msg.header
-            self._pub.publish(detections_msg)
-
-            del results
-            del cv_image
+    # ---------- services & param updates ----------
 
     def set_classes_cb(
         self,
@@ -394,9 +385,47 @@ class YoloNode(LifecycleNode):
         res: SetClasses.Response,
     ) -> SetClasses.Response:
         self.get_logger().info(f"Setting classes: {req.classes}")
-        self.yolo.set_classes(req.classes)
-        self.get_logger().info(f"New classes: {self.yolo.names}")
+        try:
+            if isinstance(self.yolo, (YOLOWorld, YOLOE)):
+                self.yolo.set_classes(list(req.classes))
+                self.classes = list(req.classes)
+                self.get_logger().info(f"New classes: {self.yolo.names}")
+            else:
+                self.get_logger().warn("SetClasses called, but model does not support open-vocab prompts.")
+        except Exception as e:
+            self.get_logger().warn(f"set_classes failed: {e}")
         return res
+
+    def _on_params_changed(self, params):
+        """Allow live updates to 'classes' via parameter API."""
+        new_classes = None
+        for p in params:
+            if p.name == "classes":
+                try:
+                    if p.type_ == ParameterType.PARAMETER_STRING_ARRAY:
+                        lst = list(p.value)
+                        new_classes = [s for s in lst if s and s != "__dummy__"]
+                    elif p.type_ == ParameterType.PARAMETER_STRING:
+                        s = (p.value or "").strip()
+                        parsed = list(yaml.safe_load(s)) if s else []
+                        new_classes = [x for x in parsed if x and x != "__dummy__"]
+                except Exception as e:
+                    self.get_logger().warn(f"Failed to parse updated 'classes': {e}")
+
+        if new_classes is not None:
+            try:
+                if hasattr(self, "yolo") and isinstance(self.yolo, (YOLOWorld, YOLOE)):
+                    self.yolo.set_classes(new_classes)
+                    self.classes = new_classes
+                    self.get_logger().info(f"Updated open-vocab classes: {self.classes}")
+                else:
+                    # Will be applied on activate
+                    self.classes = new_classes
+                    self.get_logger().info(f"Queued open-vocab classes for activation: {self.classes}")
+            except Exception as e:
+                self.get_logger().warn(f"set_classes (update) failed: {e}")
+
+        return SetParametersResult(successful=True)
 
 
 def main():

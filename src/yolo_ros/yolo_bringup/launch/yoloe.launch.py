@@ -1,18 +1,5 @@
 # Copyright (C) 2023 Miguel Ángel González Santamarta
-
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
+# GPLv3
 
 import os
 from launch import LaunchDescription
@@ -35,8 +22,12 @@ def generate_launch_description():
                     )
                 ),
                 launch_arguments={
+                    # lock to YOLO-E
                     "model_type": "YOLOE",
-                    "model": LaunchConfiguration("model", default="yoloe-11l-seg-pf.pt"),
+
+                    # NOTE: non-PF so text prompts work
+                    "model": LaunchConfiguration("model", default="yoloe-11l-seg.pt"),
+
                     "tracker": LaunchConfiguration("tracker", default="bytetrack.yaml"),
                     "device": LaunchConfiguration("device", default="cuda:0"),
                     "enable": LaunchConfiguration("enable", default="True"),
@@ -48,6 +39,14 @@ def generate_launch_description():
                         "image_reliability", default="1"
                     ),
                     "namespace": LaunchConfiguration("namespace", default="yolo"),
+
+                    # NEW: forward text prompts to yolo.launch.py → yolo_node.py
+                    # You can pass it as a YAML list: classes:="['mug','bottle']"
+                    "classes": LaunchConfiguration("classes", default="['__dummy__']"),
+
+                    # (optional) expose tracking/3D toggles via this wrapper too:
+                    # "use_tracking": LaunchConfiguration("use_tracking", default="True"),
+                    # "use_3d": LaunchConfiguration("use_3d", default="False"),
                 }.items(),
             )
         ]
