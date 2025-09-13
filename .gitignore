@@ -17,3 +17,8 @@ Models/
 *.safetensors
 *.engine
 *.bin
+
+# Ultralytics cache / weights
+mobileclip_blt.ts
+*.pt
+.cache/
