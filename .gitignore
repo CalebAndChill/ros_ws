@@ -22,3 +22,7 @@ Models/
 mobileclip_blt.ts
 *.pt
 .cache/
+# picture removal
+/Pictures/*
+!/Pictures/.gitkeep
+

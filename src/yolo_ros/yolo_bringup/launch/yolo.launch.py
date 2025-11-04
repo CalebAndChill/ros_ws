@@ -1,15 +1,14 @@
 # Copyright (C) 2023 Miguel Ángel González Santamarta
-
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
@@ -19,6 +18,8 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch.conditions import IfCondition
+from launch_ros.parameter_descriptions import ParameterValue
+
 
 
 def generate_launch_description():
@@ -214,12 +215,48 @@ def generate_launch_description():
             description="Whether to activate the debug node",
         )
 
-        # NEW: classes (text prompts)
+        # ---------------- NEW: text prompts (open-vocab) ----------------
         classes = LaunchConfiguration("classes")
         classes_cmd = DeclareLaunchArgument(
             "classes",
             default_value="['__dummy__']",
             description="Open-vocabulary class prompts for YOLO-E/YOLO-World (YAML list or string array, e.g. \"['mug','bottle']\")",
+        )
+
+        # ---------------- NEW: visual/picture prompts -------------------
+        vp_enable = LaunchConfiguration("vp_enable")
+        vp_enable_cmd = DeclareLaunchArgument(
+            "vp_enable",
+            default_value="False",
+            description="Enable YOLO-E visual (image) prompts",
+        )
+
+        vp_refer_image = LaunchConfiguration("vp_refer_image")
+        vp_refer_image_cmd = DeclareLaunchArgument(
+            "vp_refer_image",
+            default_value="",
+            description="Reference image path for visual prompts (optional)",
+        )
+
+        vp_bboxes = LaunchConfiguration("vp_bboxes")
+        vp_bboxes_cmd = DeclareLaunchArgument(
+            "vp_bboxes",
+            default_value="[]",
+            description="YAML list of boxes [[x1,y1,x2,y2], ...] in the reference (or current) image",
+        )
+
+        vp_cls = LaunchConfiguration("vp_cls")
+        vp_cls_cmd = DeclareLaunchArgument(
+            "vp_cls",
+            default_value="[]",
+            description="YAML list of prompt class IDs [0,1,...] (sequential) for the visual prompts",
+        )
+
+        vp_use_current_frame = LaunchConfiguration("vp_use_current_frame")
+        vp_use_current_frame_cmd = DeclareLaunchArgument(
+            "vp_use_current_frame",
+            default_value="False",
+            description="Use the current frame as the reference image for visual prompts",
         )
 
         # get topics for remap
@@ -239,7 +276,7 @@ def generate_launch_description():
             executable="yolo_node",
             name="yolo_node",
             namespace=namespace,
-            cwd=os.path.expanduser("~"), 
+            cwd=os.path.expanduser("~"),
             parameters=[
                 {
                     "model_type": model_type,
@@ -257,8 +294,15 @@ def generate_launch_description():
                     "agnostic_nms": agnostic_nms,
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
-                    # NEW: pass classes into the node
+                    # Text prompts
                     "classes": classes,
+                    # Visual prompts
+                    "vp_enable": vp_enable,
+                    "vp_refer_image": vp_refer_image,
+                    "vp_bboxes": ParameterValue(vp_bboxes, value_type=str),
+                    "vp_cls": ParameterValue(vp_cls, value_type=str),
+
+                    "vp_use_current_frame": vp_use_current_frame,
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -336,8 +380,14 @@ def generate_launch_description():
             maximum_detection_threshold_cmd,
             namespace_cmd,
             use_debug_cmd,
-            # NEW: declare classes arg
+            # NEW: declare text + visual prompt args
             classes_cmd,
+            vp_enable_cmd,
+            vp_refer_image_cmd,
+            vp_bboxes_cmd,
+            vp_cls_cmd,
+            vp_use_current_frame_cmd,
+            # Nodes
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,

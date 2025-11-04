@@ -32,6 +32,12 @@ def generate_launch_description():
                     "device": LaunchConfiguration("device", default="cuda:0"),
                     "enable": LaunchConfiguration("enable", default="True"),
                     "threshold": LaunchConfiguration("threshold", default="0.5"),
+                    "vp_enable": LaunchConfiguration("vp_enable", default="False"),
+                    "vp_refer_image": LaunchConfiguration("vp_refer_image", default=""),
+                    "vp_bboxes": LaunchConfiguration("vp_bboxes", default="[]"),
+                    "vp_cls": LaunchConfiguration("vp_cls", default="[]"),
+                    "vp_use_current_frame": LaunchConfiguration("vp_use_current_frame", default="False"),
+
                     "input_image_topic": LaunchConfiguration(
                         "input_image_topic", default="/camera/rgb/image_raw"
                     ),
