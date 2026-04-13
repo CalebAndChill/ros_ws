@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<robot name="g1_29dof">
+  <virtual_joint
+    name="world_joint"
+    type="fixed"
+    parent_frame="world"
+    child_link="pelvis" />
+
+  <group name="right_arm">
+    <chain base_link="torso_link" tip_link="right_rubber_hand" />
+  </group>
+
+  <group name="right_hand">
+    <link name="right_rubber_hand" />
+  </group>
+
+  <end_effector
+    name="right_eef"
+    parent_link="right_rubber_hand"
+    group="right_hand"
+    parent_group="right_arm" />
+</robot>
