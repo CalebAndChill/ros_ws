@@ -49,7 +49,7 @@ class BestMaskMainMassPCA(Node):
         self.declare_parameter('mask_shrink_px', 0)
         self.declare_parameter('min_score', 0.0)
         self.declare_parameter('allowed_classes', [])
-        self.declare_parameter('max_points', 40000)
+        self.declare_parameter('max_points', 40000)             # publish-cloud cap only
         self.declare_parameter('z_min', 0.05)
         self.declare_parameter('z_max', 10.0)
         self.declare_parameter('use_roi', True)
@@ -60,9 +60,19 @@ class BestMaskMainMassPCA(Node):
         self.declare_parameter('min_component_pixels', 20)
         self.declare_parameter('depth_band_m', 0.08)
 
+        # Output frame
         # "" = keep native depth/camera frame
-        # set to torso_link later if TF is available
         self.declare_parameter('output_frame', '')
+
+        # NEW: optional override for the frame that projected 3D points should be considered in.
+        # Leave blank to preserve current behavior.
+        self.declare_parameter('projection_frame_override', '')
+
+        # -------- Optional performance knobs (defaults preserve current behavior) --------
+        self.declare_parameter('process_every_n', 1)      # 1 = process every callback
+        self.declare_parameter('max_pca_points', 0)       # 0 = disabled, preserve old behavior
+        self.declare_parameter('publish_cloud', True)     # preserve current behavior
+        self.declare_parameter('publish_markers', True)   # preserve current behavior
 
         self.det_topic = self.get_parameter('detections_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
@@ -86,6 +96,15 @@ class BestMaskMainMassPCA(Node):
         self.depth_band_m = float(self.get_parameter('depth_band_m').value)
 
         self.output_frame = str(self.get_parameter('output_frame').value).strip()
+        self.projection_frame_override = str(
+            self.get_parameter('projection_frame_override').value
+        ).strip()
+
+        self.process_every_n = max(1, int(self.get_parameter('process_every_n').value))
+        self.max_pca_points = int(self.get_parameter('max_pca_points').value)
+        self.publish_cloud = bool(self.get_parameter('publish_cloud').value)
+        self.publish_markers = bool(self.get_parameter('publish_markers').value)
+
         self.add_on_set_parameters_callback(self._on_param_change)
 
         # ---------------- State ----------------
@@ -96,6 +115,8 @@ class BestMaskMainMassPCA(Node):
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self._cb_count = 0
 
         # ---------------- QoS ----------------
         depth_qos = QoSProfile(
@@ -127,6 +148,13 @@ class BestMaskMainMassPCA(Node):
             f'  cloud_topic:      {self.cloud_topic}\n'
             f'  marker_topic:     {self.marker_topic}\n'
             f'  output_frame:     {self.output_frame if self.output_frame else "[depth frame]"}\n'
+            f'  projection_frame: {self.projection_frame_override if self.projection_frame_override else "[depth frame]"}\n'
+            f'  sample_stride:    {self.sample_stride}\n'
+            f'  process_every_n:  {self.process_every_n}\n'
+            f'  max_pca_points:   {self.max_pca_points}\n'
+            f'  max_points:       {self.max_points}\n'
+            f'  publish_cloud:    {self.publish_cloud}\n'
+            f'  publish_markers:  {self.publish_markers}\n'
             f'  use_main_component:{self.use_main_component}\n'
             f'  min_component_pixels:{self.min_component_pixels}\n'
             f'  depth_band_m:     {self.depth_band_m}'
@@ -142,6 +170,11 @@ class BestMaskMainMassPCA(Node):
                 self.get_logger().info(
                     f'Updated output_frame -> {self.output_frame if self.output_frame else "[depth frame]"}'
                 )
+            elif p.name == 'projection_frame_override':
+                self.projection_frame_override = str(p.value).strip()
+                self.get_logger().info(
+                    f'Updated projection_frame_override -> {self.projection_frame_override if self.projection_frame_override else "[depth frame]"}'
+                )
             elif p.name == 'depth_band_m':
                 self.depth_band_m = float(p.value)
                 self.get_logger().info(f'Updated depth_band_m -> {self.depth_band_m}')
@@ -151,6 +184,30 @@ class BestMaskMainMassPCA(Node):
             elif p.name == 'use_main_component':
                 self.use_main_component = bool(p.value)
                 self.get_logger().info(f'Updated use_main_component -> {self.use_main_component}')
+            elif p.name == 'sample_stride':
+                self.sample_stride = max(1, int(p.value))
+                self.get_logger().info(f'Updated sample_stride -> {self.sample_stride}')
+            elif p.name == 'process_every_n':
+                self.process_every_n = max(1, int(p.value))
+                self.get_logger().info(f'Updated process_every_n -> {self.process_every_n}')
+            elif p.name == 'max_pca_points':
+                self.max_pca_points = int(p.value)
+                self.get_logger().info(f'Updated max_pca_points -> {self.max_pca_points}')
+            elif p.name == 'publish_cloud':
+                self.publish_cloud = bool(p.value)
+                self.get_logger().info(f'Updated publish_cloud -> {self.publish_cloud}')
+            elif p.name == 'publish_markers':
+                self.publish_markers = bool(p.value)
+                self.get_logger().info(f'Updated publish_markers -> {self.publish_markers}')
+            elif p.name == 'max_points':
+                self.max_points = int(p.value)
+                self.get_logger().info(f'Updated max_points -> {self.max_points}')
+            elif p.name == 'roi_expand_px':
+                self.roi_expand_px = int(p.value)
+                self.get_logger().info(f'Updated roi_expand_px -> {self.roi_expand_px}')
+            elif p.name == 'min_score':
+                self.min_score = float(p.value)
+                self.get_logger().info(f'Updated min_score -> {self.min_score}')
 
         return SetParametersResult(successful=True)
 
@@ -168,42 +225,61 @@ class BestMaskMainMassPCA(Node):
         self.depth = self.bridge.imgmsg_to_cv2(msg)
 
     def cb_det(self, det_arr: DetectionArray):
-        marker_array = MarkerArray()
-        delete_all = Marker()
-        delete_all.action = Marker.DELETEALL
-        marker_array.markers.append(delete_all)
+        self._cb_count += 1
+        if self.process_every_n > 1 and (self._cb_count % self.process_every_n) != 0:
+            return
+
+        marker_array = None
+        if self.publish_markers:
+            marker_array = MarkerArray()
+            delete_all = Marker()
+            delete_all.action = Marker.DELETEALL
+            marker_array.markers.append(delete_all)
 
         if self.depth is None or self.fx is None:
-            self.pub_markers.publish(marker_array)
+            if self.publish_markers:
+                self.pub_markers.publish(marker_array)
             return
 
         best_det = self._pick_best_detection(det_arr)
         if best_det is None:
-            self.pub_markers.publish(marker_array)
+            if self.publish_markers:
+                self.pub_markers.publish(marker_array)
             return
 
         pts = self._points_from_detection(best_det)
         if pts is None or pts.shape[0] < 10:
-            self.pub_markers.publish(marker_array)
+            if self.publish_markers:
+                self.pub_markers.publish(marker_array)
             return
 
-        frame_id = self.depth_frame
+        # NEW: allow an override for the frame the projected points should be treated as belonging to
+        source_frame = self.projection_frame_override if self.projection_frame_override else self.depth_frame
+        frame_id = source_frame
 
         # Optional transform to another frame, e.g. torso_link
-        if self.output_frame and self.output_frame != self.depth_frame:
-            transformed = self._transform_points(pts, self.depth_frame, self.output_frame)
+        if self.output_frame and self.output_frame != source_frame:
+            transformed = self._transform_points(pts, source_frame, self.output_frame)
             if transformed is None:
                 self.get_logger().warn(
-                    f'Could not transform points from {self.depth_frame} to {self.output_frame}'
+                    f'Could not transform points from {source_frame} to {self.output_frame}'
                 )
-                self.pub_markers.publish(marker_array)
+                if self.publish_markers:
+                    self.pub_markers.publish(marker_array)
                 return
             pts = transformed
             frame_id = self.output_frame
 
-        pca = self._compute_pca_obb(pts)
+        # -------- Downsample BEFORE PCA if requested --------
+        pca_pts = pts
+        if self.max_pca_points > 0 and pca_pts.shape[0] > self.max_pca_points:
+            sel = np.random.choice(pca_pts.shape[0], self.max_pca_points, replace=False)
+            pca_pts = pca_pts[sel]
+
+        pca = self._compute_pca_obb(pca_pts)
         if pca is None:
-            self.pub_markers.publish(marker_array)
+            if self.publish_markers:
+                self.pub_markers.publish(marker_array)
             return
 
         centroid, eigvecs, extents, corners = pca
@@ -216,24 +292,26 @@ class BestMaskMainMassPCA(Node):
 
         stamp = self.get_clock().now().to_msg()
 
-        header = Header()
-        header.stamp = stamp
-        header.frame_id = frame_id
-        cloud_msg = point_cloud2.create_cloud_xyz32(header, cloud_pts.tolist())
-        self.pub_cloud.publish(cloud_msg)
+        if self.publish_cloud:
+            header = Header()
+            header.stamp = stamp
+            header.frame_id = frame_id
+            cloud_msg = point_cloud2.create_cloud_xyz32(header, cloud_pts.tolist())
+            self.pub_cloud.publish(cloud_msg)
 
-        marker_array.markers.extend(
-            self._build_markers(
-                frame_id=frame_id,
-                stamp=stamp,
-                det=best_det,
-                centroid=centroid,
-                eigvecs=eigvecs,
-                extents=extents,
-                corners=corners,
+        if self.publish_markers:
+            marker_array.markers.extend(
+                self._build_markers(
+                    frame_id=frame_id,
+                    stamp=stamp,
+                    det=best_det,
+                    centroid=centroid,
+                    eigvecs=eigvecs,
+                    extents=extents,
+                    corners=corners,
+                )
             )
-        )
-        self.pub_markers.publish(marker_array)
+            self.pub_markers.publish(marker_array)
 
     # --------------------------------------------------
     # Detection selection
