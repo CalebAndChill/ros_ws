@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+PCA/OBB markers -> right-hand pregrasp point -> torso-frame WRIST IK target.
+
+This does NOT move the robot.
+
+It combines:
+1. pca_obb_to_right_pregrasp.py
+   - reads /best_mask_pca_markers
+   - finds centroid, chosen PCA axis, OBB extent
+   - computes a right-hand-friendly pregrasp point (where the hand center
+     should sit relative to the object)
+
+2. camera_to_torso.py
+   - uses the G1 URDF to convert camera optical frame points to torso_link
+
+3. Hand-length offset for Dex3-1
+   - IK targets right_wrist_yaw_link, but the grasp happens at the hand/palm
+     center, which is ~10 cm further out along the arm's approach line.
+   - We pull the IK target BACK toward the body by --hand-offset so the
+     wrist ends up at a position that puts the hand center at the original
+     pregrasp point.
+
+Outputs:
+  /right_pregrasp_camera_point   geometry_msgs/PointStamped
+      Pregrasp (hand center) in the input camera optical frame.
+  /right_pregrasp_torso_point    geometry_msgs/PointStamped
+      WRIST target in torso_link, ready to feed into the IK script.
+  /right_pregrasp_torso_markers  visualization_msgs/MarkerArray
+      Both the pregrasp (cyan) and the wrist target (green/red) plus an
+      arrow showing the hand offset.
+
+Use:
+  python3 ~/ros2_ws/tools/movement/pca_obb_to_torso_pregrasp.py
+
+Then in another terminal:
+  ros2 topic echo /right_pregrasp_torso_point
+"""
+
+import argparse
+import math
+import os
+import sys
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pinocchio as pin
+
+import rclpy
+from rclpy.node import Node
+
+from geometry_msgs.msg import Point, PointStamped
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+URDF = "/home/caleb/gazebo_g1_ws/src/g1_description/urdf/g1_29dof_d435i.urdf"
+MESH_DIRS = ["/home/caleb/gazebo_g1_ws/src"]
+
+TORSO_FRAME = "torso_link"
+
+CAMERA_FRAME_CANDIDATES = (
+    "camera_color_optical_frame",
+    "d435_color_optical_frame",
+    "d435i_color_optical_frame",
+    "d435_optical_frame",
+    "d435i_optical_frame",
+    "camera_optical_frame",
+)
+
+
+class StaticUrdfTransformer:
+    """
+    Uses Pinocchio + URDF for static camera optical -> torso transform.
+
+    The RealSense ROS frame can be camera_color_optical_frame, while the URDF may
+    call the same physical frame d435_optical_frame. If the incoming frame is not
+    in the URDF, this resolves to a known optical camera frame.
+    """
+
+    def __init__(self, urdf: str, mesh_dirs: List[str], torso_frame: str):
+        self.urdf = urdf
+        self.mesh_dirs = mesh_dirs
+        self.torso_frame = torso_frame
+
+        if not os.path.exists(self.urdf):
+            raise FileNotFoundError(f"URDF not found: {self.urdf}")
+
+        self.model, _, _ = pin.buildModelsFromUrdf(self.urdf, self.mesh_dirs)
+        self.data = self.model.createData()
+
+        q = pin.neutral(self.model)
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+
+        if not self.model.existFrame(self.torso_frame):
+            raise RuntimeError(f"Torso frame '{self.torso_frame}' not found in URDF")
+
+        self.auto_camera_frame = self.resolve_camera_frame(None)
+
+    def resolve_camera_frame(self, requested: Optional[str]) -> str:
+        if requested:
+            if self.model.existFrame(requested):
+                return requested
+            raise RuntimeError(
+                f"Requested camera frame '{requested}' not in URDF. "
+                f"Try --camera-frame d435_optical_frame or run camera_to_torso.py --list."
+            )
+
+        for name in CAMERA_FRAME_CANDIDATES:
+            if self.model.existFrame(name):
+                return name
+
+        for f in self.model.frames:
+            if f.name.endswith("_optical_frame"):
+                return f.name
+
+        raise RuntimeError("Could not find camera optical frame in URDF")
+
+    def frame_to_torso_transform(self, input_frame: str) -> pin.SE3:
+        """
+        Return transform T such that:
+            p_torso = T.act(p_input)
+        """
+
+        if input_frame == self.torso_frame:
+            return pin.SE3.Identity()
+
+        frame_to_use = input_frame
+
+        # If RealSense says camera_color_optical_frame but URDF lacks it,
+        # use the resolved URDF optical frame.
+        if not self.model.existFrame(frame_to_use):
+            frame_to_use = self.auto_camera_frame
+
+        pid = self.model.getFrameId(self.torso_frame)
+        cid = self.model.getFrameId(frame_to_use)
+
+        return self.data.oMf[pid].actInv(self.data.oMf[cid])
+
+
+def apply_hand_offset(pregrasp_torso: np.ndarray,
+                      hand_offset: float,
+                      mode: str) -> np.ndarray:
+    """
+    Move pregrasp point BACK toward the body by `hand_offset` meters,
+    producing the WRIST target position.
+
+    mode='horizontal': pull back along the xy direction from torso origin.
+                      Keeps z unchanged. Best for side-grasping at chest height,
+                      because the hand sits at the same height as the wrist.
+    mode='radial'   : pull back along the 3D direction from torso origin.
+                      Also pulls down/up if target is above/below origin.
+    mode='none'     : no offset (return pregrasp unchanged).
+    """
+    if hand_offset <= 1e-6 or mode == "none":
+        return pregrasp_torso.copy()
+
+    if mode == "horizontal":
+        h = float(np.linalg.norm(pregrasp_torso[:2]))
+        if h < 1e-6:
+            return pregrasp_torso.copy()
+        dir_h = np.array([pregrasp_torso[0] / h, pregrasp_torso[1] / h, 0.0])
+        return pregrasp_torso - dir_h * hand_offset
+
+    if mode == "radial":
+        r = float(np.linalg.norm(pregrasp_torso))
+        if r < 1e-6:
+            return pregrasp_torso.copy()
+        return pregrasp_torso - (pregrasp_torso / r) * hand_offset
+
+    return pregrasp_torso.copy()
+
+
+class PcaObbToTorsoPregrasp(Node):
+    def __init__(self, args):
+        super().__init__("pca_obb_to_torso_pregrasp")
+
+        self.input_topic = args.input_topic
+        self.camera_point_topic = args.camera_point_topic
+        self.torso_point_topic = args.torso_point_topic
+        self.torso_marker_topic = args.marker_topic
+        self.camera_marker_topic = args.camera_marker_topic
+
+        self.approach_axis_id = args.approach_axis_id
+        self.clearance = args.clearance
+        self.max_standoff = args.max_standoff
+        self.direction_sign = args.direction_sign
+
+        self.hand_offset = float(args.hand_offset)
+        self.hand_offset_mode = args.hand_offset_mode
+
+        self.target_forward_offset = args.target_forward_offset
+        self.target_left_offset = args.target_left_offset
+        self.target_up_offset = args.target_up_offset
+
+        self.debug = args.debug
+        self.log_every_n = max(1, args.log_every_n)
+
+        self.ws_min_forward = args.ws_min_forward
+        self.ws_max_forward = args.ws_max_forward
+        self.ws_min_left = args.ws_min_left
+        self.ws_max_left = args.ws_max_left
+        self.ws_min_up = args.ws_min_up
+        self.ws_max_up = args.ws_max_up
+        self.reject_outside_workspace = args.reject_outside_workspace
+
+        self.tf = StaticUrdfTransformer(
+            urdf=URDF,
+            mesh_dirs=MESH_DIRS,
+            torso_frame=TORSO_FRAME,
+        )
+
+        self.sub = self.create_subscription(
+            MarkerArray,
+            self.input_topic,
+            self.cb_markers,
+            10,
+        )
+
+        self.pub_camera_point = self.create_publisher(
+            PointStamped,
+            self.camera_point_topic,
+            10,
+        )
+        self.pub_torso_point = self.create_publisher(
+            PointStamped,
+            self.torso_point_topic,
+            10,
+        )
+        self.pub_torso_markers = self.create_publisher(
+            MarkerArray,
+            self.torso_marker_topic,
+            10,
+        )
+        self.pub_camera_markers = self.create_publisher(
+            MarkerArray,
+            self.camera_marker_topic,
+            10,
+        )
+
+        self.cb_count = 0
+
+        self.get_logger().info(f"Listening on: {self.input_topic}")
+        self.get_logger().info(f"Publishing camera/source pregrasp: {self.camera_point_topic}")
+        self.get_logger().info(f"Publishing torso WRIST target:   {self.torso_point_topic}")
+        self.get_logger().info(f"Publishing torso markers:        {self.torso_marker_topic}")
+        self.get_logger().info(f"Publishing camera markers:       {self.camera_marker_topic}")
+        self.get_logger().info(f"URDF camera frame auto-resolved as: {self.tf.auto_camera_frame}")
+        self.get_logger().info(
+            f"axis_id={self.approach_axis_id}, clearance={self.clearance:.3f}, "
+            f"max_standoff={self.max_standoff:.3f}, direction_sign={self.direction_sign}"
+        )
+        self.get_logger().info(
+            f"hand_offset={self.hand_offset:.3f} m ({self.hand_offset_mode}); "
+            f"IK target is pulled back this much so hand center sits at pregrasp."
+        )
+
+    def cb_markers(self, msg: MarkerArray):
+        self.cb_count += 1
+
+        centroid_marker = None
+        axis_marker = None
+        obb_marker = None
+
+        for m in msg.markers:
+            if m.action == Marker.DELETEALL:
+                continue
+            if m.type == Marker.SPHERE and m.id == 0:
+                centroid_marker = m
+            elif m.type == Marker.ARROW and m.id == self.approach_axis_id:
+                axis_marker = m
+            elif m.type == Marker.LINE_LIST and m.id == 4:
+                obb_marker = m
+
+        if centroid_marker is None or axis_marker is None or obb_marker is None:
+            return
+
+        source_frame = centroid_marker.header.frame_id
+        stamp = self.get_clock().now().to_msg()
+
+        centroid = np.array(
+            [
+                centroid_marker.pose.position.x,
+                centroid_marker.pose.position.y,
+                centroid_marker.pose.position.z,
+            ],
+            dtype=float,
+        )
+
+        if len(axis_marker.points) < 2:
+            return
+
+        a0 = np.array(
+            [axis_marker.points[0].x, axis_marker.points[0].y, axis_marker.points[0].z],
+            dtype=float,
+        )
+        a1 = np.array(
+            [axis_marker.points[1].x, axis_marker.points[1].y, axis_marker.points[1].z],
+            dtype=float,
+        )
+
+        axis = a1 - a0
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-8:
+            return
+        axis = axis / axis_norm
+
+        corners = self.extract_unique_corners(obb_marker.points)
+        if corners.shape[0] < 4:
+            return
+
+        proj = (corners - centroid) @ axis
+        extent = float(np.max(proj) - np.min(proj))
+        half_extent = 0.5 * extent
+        standoff = min(half_extent + self.clearance, self.max_standoff)
+
+        p_pos = centroid + axis * standoff
+        p_neg = centroid - axis * standoff
+
+        if self.direction_sign > 0:
+            chosen_source = p_pos
+            choice = "+axis"
+        elif self.direction_sign < 0:
+            chosen_source = p_neg
+            choice = "-axis"
+        else:
+            # For camera optical frame, larger x is camera's right side,
+            # which is usually more right-arm friendly.
+            if p_pos[0] >= p_neg[0]:
+                chosen_source = p_pos
+                choice = "+axis auto/right"
+            else:
+                chosen_source = p_neg
+                choice = "-axis auto/right"
+
+        T_source_to_torso = self.tf.frame_to_torso_transform(source_frame)
+
+        # Where the HAND/PALM CENTER should end up (in torso frame).
+        pregrasp_torso = np.asarray(T_source_to_torso.act(chosen_source), dtype=float)
+
+        # WRIST IK target = pregrasp pulled back toward the body by hand_offset.
+        wrist_target_torso = apply_hand_offset(
+            pregrasp_torso,
+            self.hand_offset,
+            self.hand_offset_mode,
+        )
+
+        # Optional fine-tuning offsets applied to the wrist target.
+        wrist_target_torso = wrist_target_torso + np.array(
+            [
+                self.target_forward_offset,
+                self.target_left_offset,
+                self.target_up_offset,
+            ],
+            dtype=float,
+        )
+
+        fwd, left, up = map(float, wrist_target_torso)
+        pre_f, pre_l, pre_u = map(float, pregrasp_torso)
+        inside = self.workspace_ok(fwd, left, up)
+
+        should_log = self.debug or (self.cb_count % self.log_every_n == 0)
+        if should_log:
+            self.get_logger().info(
+                f"source_frame={source_frame} centroid={centroid.round(4).tolist()} "
+                f"axis={axis.round(4).tolist()} extent={extent:.4f} standoff={standoff:.4f}"
+            )
+            self.get_logger().info(
+                f"source chosen={chosen_source.round(4).tolist()} [{choice}]"
+            )
+            self.get_logger().info(
+                f"  hand center (torso)  = [{pre_f:+.4f}, {pre_l:+.4f}, {pre_u:+.4f}]"
+            )
+            self.get_logger().info(
+                f"  WRIST target (torso) = [{fwd:+.4f}, {left:+.4f}, {up:+.4f}] "
+                f"workspace={'OK' if inside else 'OUTSIDE'}"
+            )
+            self.get_logger().info(
+                f"  IK args: --target-forward {fwd:.4f} --target-left {left:.4f} --target-up {up:.4f}"
+            )
+
+        self.publish_point(self.pub_camera_point, source_frame, stamp, chosen_source)
+
+        # Camera-frame visualization: back-transform the (final) torso wrist
+        # target into the source/camera frame so it overlays the bottle/OBB
+        # markers from best_mask_pca (which live in camera_color_optical_frame).
+        wrist_target_source = np.asarray(
+            T_source_to_torso.actInv(wrist_target_torso), dtype=float
+        )
+        # chosen_source is the original hand-center pregrasp in camera frame
+        # (before any torso-frame offsets); use it directly as the "hand" point.
+        hand_in_source = np.asarray(chosen_source, dtype=float)
+
+        # Camera-frame markers are useful for visual sanity-checking against
+        # the perception output regardless of workspace, so publish them
+        # always (not gated on inside/reject).
+        self.publish_markers(
+            self.pub_camera_markers,
+            source_frame,
+            "right_pregrasp_camera",
+            stamp,
+            hand_in_source,
+            wrist_target_source,
+            inside,
+        )
+
+        # Always publish the torso target.
+        # The actual IK/movement script is responsible for workspace/boundary checks.
+        # This node should only compute and publish perception-derived targets.
+        if not inside:
+            self.get_logger().warn(
+                f"WRIST target outside pregrasp-node workspace estimate, but publishing anyway: "
+                f"forward={fwd:+.3f}, left={left:+.3f}, up={up:+.3f}"
+            )
+
+        self.publish_point(self.pub_torso_point, TORSO_FRAME, stamp, wrist_target_torso)
+        self.publish_markers(
+            self.pub_torso_markers,
+            TORSO_FRAME,
+            "right_pregrasp_torso",
+            stamp,
+            pregrasp_torso,
+            wrist_target_torso,
+            inside,
+        )
+
+    def workspace_ok(self, fwd: float, left: float, up: float) -> bool:
+        return (
+            self.ws_min_forward <= fwd <= self.ws_max_forward
+            and self.ws_min_left <= left <= self.ws_max_left
+            and self.ws_min_up <= up <= self.ws_max_up
+        )
+
+    @staticmethod
+    def extract_unique_corners(points):
+        uniq = {}
+        for p in points:
+            key = (round(p.x, 5), round(p.y, 5), round(p.z, 5))
+            uniq[key] = [p.x, p.y, p.z]
+        return np.array(list(uniq.values()), dtype=float)
+
+    @staticmethod
+    def publish_point(pub, frame_id: str, stamp, xyz):
+        msg = PointStamped()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = stamp
+        msg.point.x = float(xyz[0])
+        msg.point.y = float(xyz[1])
+        msg.point.z = float(xyz[2])
+        pub.publish(msg)
+
+    def publish_markers(self,
+                        pub,
+                        frame_id: str,
+                        namespace: str,
+                        stamp,
+                        pregrasp: np.ndarray,
+                        wrist_target: np.ndarray,
+                        inside_workspace: bool):
+        arr = MarkerArray()
+
+        delete_all = Marker()
+        delete_all.action = Marker.DELETEALL
+        delete_all.ns = namespace
+        arr.markers.append(delete_all)
+
+        # WRIST target (the IK input). Green if inside workspace, red if outside.
+        wrist_sphere = Marker()
+        wrist_sphere.header.frame_id = frame_id
+        wrist_sphere.header.stamp = stamp
+        wrist_sphere.ns = namespace
+        wrist_sphere.id = 1
+        wrist_sphere.type = Marker.SPHERE
+        wrist_sphere.action = Marker.ADD
+        wrist_sphere.pose.orientation.w = 1.0
+        wrist_sphere.pose.position.x = float(wrist_target[0])
+        wrist_sphere.pose.position.y = float(wrist_target[1])
+        wrist_sphere.pose.position.z = float(wrist_target[2])
+        wrist_sphere.scale.x = 0.025
+        wrist_sphere.scale.y = 0.025
+        wrist_sphere.scale.z = 0.025
+        wrist_sphere.color.a = 1.0
+        if inside_workspace:
+            wrist_sphere.color.r = 0.0
+            wrist_sphere.color.g = 1.0
+            wrist_sphere.color.b = 0.0
+        else:
+            wrist_sphere.color.r = 1.0
+            wrist_sphere.color.g = 0.0
+            wrist_sphere.color.b = 0.0
+        arr.markers.append(wrist_sphere)
+
+        # Hand-center / pregrasp position (cyan). Where the hand will actually
+        # land when the wrist is at wrist_target. Should sit on/near the object.
+        hand_sphere = Marker()
+        hand_sphere.header.frame_id = frame_id
+        hand_sphere.header.stamp = stamp
+        hand_sphere.ns = namespace
+        hand_sphere.id = 2
+        hand_sphere.type = Marker.SPHERE
+        hand_sphere.action = Marker.ADD
+        hand_sphere.pose.orientation.w = 1.0
+        hand_sphere.pose.position.x = float(pregrasp[0])
+        hand_sphere.pose.position.y = float(pregrasp[1])
+        hand_sphere.pose.position.z = float(pregrasp[2])
+        hand_sphere.scale.x = 0.022
+        hand_sphere.scale.y = 0.022
+        hand_sphere.scale.z = 0.022
+        hand_sphere.color.a = 1.0
+        hand_sphere.color.r = 0.0
+        hand_sphere.color.g = 0.8
+        hand_sphere.color.b = 1.0
+        arr.markers.append(hand_sphere)
+
+        # Arrow from wrist target -> hand center, so it's visually obvious
+        # how far the hand sticks out past the wrist.
+        offset_arrow = Marker()
+        offset_arrow.header.frame_id = frame_id
+        offset_arrow.header.stamp = stamp
+        offset_arrow.ns = namespace
+        offset_arrow.id = 3
+        offset_arrow.type = Marker.ARROW
+        offset_arrow.action = Marker.ADD
+        offset_arrow.pose.orientation.w = 1.0
+        offset_arrow.scale.x = 0.005   # shaft
+        offset_arrow.scale.y = 0.012   # head diameter
+        offset_arrow.scale.z = 0.018   # head length
+        offset_arrow.color.a = 1.0
+        offset_arrow.color.r = 1.0
+        offset_arrow.color.g = 1.0
+        offset_arrow.color.b = 0.0
+        a = Point()
+        a.x, a.y, a.z = float(wrist_target[0]), float(wrist_target[1]), float(wrist_target[2])
+        b = Point()
+        b.x, b.y, b.z = float(pregrasp[0]),     float(pregrasp[1]),     float(pregrasp[2])
+        offset_arrow.points = [a, b]
+        arr.markers.append(offset_arrow)
+
+        # Text label near the wrist target showing both coords.
+        text = Marker()
+        text.header.frame_id = frame_id
+        text.header.stamp = stamp
+        text.ns = namespace
+        text.id = 4
+        text.type = Marker.TEXT_VIEW_FACING
+        text.action = Marker.ADD
+        text.pose.orientation.w = 1.0
+        text.pose.position.x = float(wrist_target[0])
+        text.pose.position.y = float(wrist_target[1])
+        text.pose.position.z = float(wrist_target[2]) + 0.05
+        text.scale.z = 0.022
+        text.color.a = 1.0
+        text.color.r = 1.0
+        text.color.g = 1.0
+        text.color.b = 1.0
+        text.text = (
+            f"wrist [{wrist_target[0]:+.3f}, {wrist_target[1]:+.3f}, {wrist_target[2]:+.3f}]\n"
+            f"hand  [{pregrasp[0]:+.3f}, {pregrasp[1]:+.3f}, {pregrasp[2]:+.3f}]"
+        )
+        arr.markers.append(text)
+
+        pub.publish(arr)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="PCA/OBB markers -> torso-frame right WRIST IK target")
+
+    p.add_argument("--input-topic", default="/best_mask_pca_markers")
+    p.add_argument("--camera-point-topic", default="/right_pregrasp_camera_point")
+    p.add_argument("--torso-point-topic", default="/right_pregrasp_torso_point")
+    p.add_argument("--marker-topic", default="/right_pregrasp_torso_markers",
+                   help="Torso-frame MarkerArray topic (hand + wrist + arrow in torso_link)")
+    p.add_argument("--camera-marker-topic", default="/right_pregrasp_camera_markers",
+                   help="Camera-frame MarkerArray topic (same content, in the source camera "
+                        "optical frame so it overlays /best_mask_pca_markers in RViz).")
+
+    p.add_argument("--approach-axis-id", type=int, default=2)
+    p.add_argument("--clearance", type=float, default=0.06)
+    p.add_argument("--max-standoff", type=float, default=0.20)
+    p.add_argument("--direction-sign", type=int, default=0)
+
+    # Dex3-1 hand-length compensation. The IK script targets right_wrist_yaw_link,
+    # but we want the hand/palm center at the pregrasp point, not the wrist.
+    # 0.10 m is a reasonable starting value for the Dex3-1; tune by observation.
+    p.add_argument("--hand-offset", type=float, default=0.10,
+                   help="Pull WRIST target back toward body by this many meters "
+                        "to compensate for Dex3-1 hand length (wrist to palm/grasp center).")
+    p.add_argument("--hand-offset-mode", choices=["horizontal", "radial", "none"],
+                   default="horizontal",
+                   help="horizontal: pull back in xy plane only (preserves height; good for "
+                        "side-grasping). radial: pull back from torso origin (3D). "
+                        "none: disable the offset.")
+
+    # Small corrections if the wrist target is systematically too close/far/high/low
+    # (applied AFTER --hand-offset).
+    p.add_argument("--target-forward-offset", type=float, default=0.0)
+    p.add_argument("--target-left-offset", type=float, default=0.0)
+    p.add_argument("--target-up-offset", type=float, default=0.0)
+
+    p.add_argument("--ws-min-forward", type=float, default=0.05)
+    p.add_argument("--ws-max-forward", type=float, default=0.40)
+    p.add_argument("--ws-min-left", type=float, default=-0.40)
+    p.add_argument("--ws-max-left", type=float, default=0.0)
+    p.add_argument("--ws-min-up", type=float, default=0.00)
+    p.add_argument("--ws-max-up", type=float, default=0.60)
+    p.add_argument("--reject-outside-workspace", action="store_true", help="Ignored: torso target is always published; IK script handles workspace rejection.")
+
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--log-every-n", type=int, default=30)
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    rclpy.init()
+    node = PcaObbToTorsoPregrasp(args)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

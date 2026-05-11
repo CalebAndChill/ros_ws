@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+"""
+G1 IK Ready-Then-Target + optional Dex3 right hand.
+
+Real robot flow:
+  1. Solve Pinocchio IK for right_wrist_yaw_link target in torso frame.
+  2. Connect to SDK2 (rt/lowstate, rt/arm_sdk, optional rt/dex3/right/cmd/state).
+  3. Read current arm state and pin left arm.
+  4. Ramp arm_sdk weight 0 -> 1.
+  5. Swing right shoulder roll outward for clearance.
+  6. Optional desk-clearance path: shoulder moves back first, then elbow bends up.
+  7. Move right arm to READY.
+  8. Optional Dex3 OPEN while holding READY.
+  9. Move right arm READY -> IK target.
+ 10. Optional Dex3 close while holding IK target, stopping early on pressure delta.
+ 11. Optional desk-exit path: elbow bends up first, then shoulder moves back.
+ 12. Release arm_sdk weight 1 -> 0.
+
+Safety notes:
+  - Does NOT publish /whole_body_controller/joint_trajectory.
+  - Does NOT command legs or waist.
+  - Writes all 14 arm joints; left arm is pinned to measured current q.
+  - Dex3 closes only at IK target if explicitly enabled and --hand-closed-q is supplied.
+  - OPEN hand at READY is allowed; hand close at rest/near leg is avoided.
+
+Intended location:
+  ~/ros2_ws/tools/movement/g1_ik_ready_then_target.py
+"""
+
+import argparse
+import os
+import site
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+HOME = os.path.expanduser("~")
+UNITREE_REPO = os.path.join(HOME, "unitree_sdk2_python")
+VENV_SITE = os.path.join(
+    HOME,
+    "unitree_sdk2_venv",
+    "lib",
+    f"python{sys.version_info.major}.{sys.version_info.minor}",
+    "site-packages",
+)
+if os.path.isdir(UNITREE_REPO) and UNITREE_REPO not in sys.path:
+    sys.path.insert(0, UNITREE_REPO)
+if os.path.isdir(VENV_SITE):
+    site.addsitedir(VENV_SITE)
+
+import numpy as np
+
+# Optional ROS2 import for --subscribe-target mode. We only need rclpy when
+# the user explicitly asks for it, so failure to import is OK.
+try:
+    import rclpy
+    from rclpy.node import Node as _RclpyNode
+    from geometry_msgs.msg import PointStamped
+    HAVE_ROS2 = True
+except ImportError:
+    HAVE_ROS2 = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pinocchio IK
+# ──────────────────────────────────────────────────────────────────────────────
+
+URDF = "/home/caleb/gazebo_g1_ws/src/g1_description/urdf/g1_29dof_d435i.urdf"
+MESH_DIRS = ["/home/caleb/gazebo_g1_ws/src"]
+TORSO_FRAME = "torso_link"
+EE_FRAME = "right_wrist_yaw_link"
+
+CONTROL_JOINTS = [
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+READY_REDUCED = {
+    "right_shoulder_pitch_joint": 0.1,
+    "right_shoulder_roll_joint": -0.20,
+    "right_shoulder_yaw_joint": 0.0,
+    "right_elbow_joint": 0.2,
+    "right_wrist_roll_joint": 0.0,
+    "right_wrist_pitch_joint": 0.0,
+    "right_wrist_yaw_joint": 0.0,
+}
+
+PIN_TO_SDK_NAME = {
+    "right_shoulder_pitch_joint": "right_shoulder_pitch",
+    "right_shoulder_roll_joint": "right_shoulder_roll",
+    "right_shoulder_yaw_joint": "right_shoulder_yaw",
+    "right_elbow_joint": "right_elbow",
+    "right_wrist_roll_joint": "right_wrist_roll",
+    "right_wrist_pitch_joint": "right_wrist_pitch",
+    "right_wrist_yaw_joint": "right_wrist_yaw",
+}
+
+RIGHT_ARM_NAMES = [
+    "right_shoulder_pitch",
+    "right_shoulder_roll",
+    "right_shoulder_yaw",
+    "right_elbow",
+    "right_wrist_roll",
+    "right_wrist_pitch",
+    "right_wrist_yaw",
+]
+
+LEFT_ARM_INDICES = [15, 16, 17, 18, 19, 20, 21]
+RIGHT_ARM_INDICES = [22, 23, 24, 25, 26, 27, 28]
+WEIGHT_SLOT = 29
+
+RIGHT_HAND_NAMES = [
+    "thumb_abduction",
+    "thumb_flex_0",
+    "thumb_flex_1",
+    "finger_left_0",
+    "finger_left_1",
+    "finger_right_0",
+    "finger_right_1",
+]
+
+RIGHT_HAND_OPEN_Q = [
+    +0.0121,
+    +0.5773,
+    -0.0285,
+    -0.0852,
+    -0.0685,
+    -0.0172,
+    -0.0819,
+]
+
+# Conservative table/desk clearance pose for the right arm.
+# Index order matches RIGHT_ARM_NAMES.
+# Idea: shoulder/roll move into clearance, elbow stays bent/up so the hand clears the desk/table.
+# Tune these from dry-run + small-step real tests.
+DEFAULT_DESK_CLEARANCE_Q = [
+    -0.20,  # right_shoulder_pitch  ("shoulder back"/lifted clearance; tune sign if needed)
+    -0.25,  # right_shoulder_roll   (outward clearance from leg/body)
+    -0.10,  # right_shoulder_yaw
+    +0.75,  # right_elbow           (bent/up, safer for clearing desk edge)
+    -0.04,  # right_wrist_roll
+    +0.02,  # right_wrist_pitch
+    -0.07,  # right_wrist_yaw
+]
+
+# Official C++ Dex3 example uses this RIS-mode packing for each motor:
+# id in low 4 bits, status=1 in bits 4..6, timeout in bit 7. timeout=0 means active.
+def dex3_mode(motor_id: int, status: int = 0x01, timeout: int = 0) -> int:
+    return (motor_id & 0x0F) | ((status & 0x07) << 4) | ((timeout & 0x01) << 7)
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def parse_q7_csv(text: str, name: str) -> List[float]:
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) != 7:
+        raise argparse.ArgumentTypeError(f"{name} must contain exactly 7 comma-separated numbers, got {len(parts)}")
+    try:
+        return [float(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{name} contains a non-number: {exc}") from exc
+
+
+def format_q7(q: Sequence[float]) -> str:
+    return ",".join(f"{float(x):+.4f}" for x in q)
+
+
+def build_reduced_model():
+    import pinocchio as pin
+
+    model, _, _ = pin.buildModelsFromUrdf(URDF, MESH_DIRS)
+    q0 = pin.neutral(model)
+    keep = set(CONTROL_JOINTS)
+    lock_ids = []
+    for joint_name in model.names:
+        if joint_name == "universe":
+            continue
+        if joint_name not in keep:
+            jid = model.getJointId(joint_name)
+            if jid != 0:
+                lock_ids.append(jid)
+    return pin.buildReducedModel(model, lock_ids, q0)
+
+
+def build_ready_q_reduced(model):
+    import pinocchio as pin
+
+    q = pin.neutral(model)
+    for i, name in enumerate(model.names[1:], start=0):
+        if name in READY_REDUCED:
+            q[i] = READY_REDUCED[name]
+    return q
+
+
+def fk(model, data, q, frame_name):
+    import pinocchio as pin
+
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+    fid = model.getFrameId(frame_name)
+    return data.oMf[fid]
+
+
+def clamp_to_limits(model, q):
+    q_c = q.copy()
+    lo = model.lowerPositionLimit.copy()
+    hi = model.upperPositionLimit.copy()
+    big = 1e10
+    for i in range(len(q_c)):
+        if lo[i] > -big and hi[i] < big:
+            q_c[i] = np.clip(q_c[i], lo[i], hi[i])
+    return q_c
+
+
+def solve_position_ik(
+    model,
+    data,
+    frame_name,
+    q_init,
+    q_nominal,
+    target_pos_world,
+    max_iters=300,
+    tol=2e-3,
+    damping=1e-3,
+    posture_gain=0.02,
+    max_step=0.10,
+    posture_weights=None,
+):
+    """
+    Position-only IK with optional weighted posture bias.
+
+    Main task:
+        put right_wrist_yaw_link at target_pos_world.
+
+    Posture task:
+        use nullspace motion to keep the arm close to q_nominal.
+
+    This is what makes the arm prefer the nice READY-looking
+    shoulder/elbow shape instead of reaching with weird geometry.
+    """
+    import pinocchio as pin
+
+    fid = model.getFrameId(frame_name)
+    q = q_init.copy()
+    err_norm = float("inf")
+
+    if posture_weights is None:
+        w = np.ones(model.nv)
+    else:
+        w = np.asarray(posture_weights, dtype=float).copy()
+        if w.shape[0] != model.nv:
+            raise ValueError(
+                f"posture_weights length {w.shape[0]} != model.nv {model.nv}"
+            )
+
+    for i in range(max_iters):
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+
+        pos = data.oMf[fid].translation
+        err = target_pos_world - pos
+        err_norm = float(np.linalg.norm(err))
+
+        if err_norm < tol:
+            return True, q, i, err_norm
+
+        J6 = pin.computeFrameJacobian(
+            model,
+            data,
+            q,
+            fid,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
+        J = J6[:3, :]
+
+        JJt = J @ J.T
+        J_pinv = J.T @ np.linalg.solve(
+            JJt + damping * np.eye(3),
+            np.eye(3),
+        )
+
+        # Primary task: move wrist toward target.
+        dq_task = J_pinv @ err
+
+        # Secondary/nullspace task: keep posture close to preferred ready shape.
+        N = np.eye(model.nv) - J_pinv @ J
+        dq_posture = posture_gain * w * (q_nominal - q)
+
+        dq = dq_task + N @ dq_posture
+
+        dq_norm = float(np.linalg.norm(dq))
+        if dq_norm > max_step:
+            dq = dq * (max_step / dq_norm)
+
+        q = pin.integrate(model, q, dq)
+        q = clamp_to_limits(model, q)
+
+    return False, q, max_iters, err_norm
+
+def _build_posture_preference_q(model, preferred_sdk_q):
+    """
+    Convert SDK-order right-arm q into the reduced Pinocchio model q.
+
+    SDK order:
+      shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
+      wrist_roll, wrist_pitch, wrist_yaw
+    """
+    import pinocchio as pin
+
+    q_pref = pin.neutral(model)
+
+    sdk_to_pin = {v: k for k, v in PIN_TO_SDK_NAME.items()}
+
+    for sdk_name, value in zip(RIGHT_ARM_NAMES, preferred_sdk_q):
+        pin_name = sdk_to_pin[sdk_name]
+        if model.existJointName(pin_name):
+            jid = model.getJointId(pin_name)
+            q_pref[model.joints[jid].idx_q] = float(value)
+
+    return q_pref
+
+
+def _make_posture_weights(model, shoulder_weight, elbow_weight, wrist_weight):
+    """
+    Build posture weights in reduced Pinocchio q order.
+
+    Higher weights = IK tries harder to keep that joint near preferred posture.
+    """
+    weights = np.ones(model.nv, dtype=float) * float(wrist_weight)
+
+    per_joint = {
+        "right_shoulder_pitch_joint": shoulder_weight,
+        "right_shoulder_roll_joint": shoulder_weight,
+        "right_shoulder_yaw_joint": shoulder_weight,
+        "right_elbow_joint": elbow_weight,
+        "right_wrist_roll_joint": wrist_weight,
+        "right_wrist_pitch_joint": wrist_weight,
+        "right_wrist_yaw_joint": wrist_weight,
+    }
+
+    for joint_name, weight in per_joint.items():
+        if model.existJointName(joint_name):
+            jid = model.getJointId(joint_name)
+            weights[model.joints[jid].idx_q] = float(weight)
+
+    return weights
+
+
+def solve_ik_for_target(
+    target_forward: float,
+    target_left: float,
+    target_up: float,
+    use_posture_bias: bool = False,
+    posture_gain: float = 0.02,
+    shoulder_weight: float = 3.0,
+    elbow_weight: float = 3.0,
+    wrist_weight: float = 0.2,
+    preferred_ready_sdk_q: Optional[Sequence[float]] = None,
+) -> Optional[Dict[str, float]]:
+    model = build_reduced_model()
+    data = model.createData()
+
+    # Existing internal ready. Keep this for the fixed torso/world reference
+    # used by the original script.
+    q_ready = build_ready_q_reduced(model)
+
+    # Posture target for the shoulder/elbow shape. Caller can override; if
+    # they don't, fall back to the historical hardcoded values.
+    if preferred_ready_sdk_q is None:
+        preferred_ready_sdk_q = [
+            -0.20,  # right_shoulder_pitch
+            -0.07,  # right_shoulder_roll
+            -0.10,  # right_shoulder_yaw
+            -0.10,  # right_elbow
+            -0.04,  # right_wrist_roll
+            +0.02,  # right_wrist_pitch
+            -0.07,  # right_wrist_yaw
+        ]
+    else:
+        if len(preferred_ready_sdk_q) != 7:
+            raise ValueError(
+                f"preferred_ready_sdk_q must have 7 values, got {len(preferred_ready_sdk_q)}"
+            )
+        preferred_ready_sdk_q = list(preferred_ready_sdk_q)
+
+    if use_posture_bias:
+        q_nominal = _build_posture_preference_q(model, preferred_ready_sdk_q)
+        posture_weights = _make_posture_weights(
+            model,
+            shoulder_weight=shoulder_weight,
+            elbow_weight=elbow_weight,
+            wrist_weight=wrist_weight,
+        )
+    else:
+        q_nominal = q_ready
+        posture_weights = np.ones(model.nv)
+
+    torso_pose = fk(model, data, q_ready, TORSO_FRAME)
+    ee_pose = fk(model, data, q_ready, EE_FRAME)
+    ee_in_torso = torso_pose.actInv(ee_pose)
+
+    target_torso = np.array(
+        [target_forward, target_left, target_up],
+        dtype=float,
+    )
+    target_world = torso_pose.rotation @ target_torso + torso_pose.translation
+
+    print(f"  READY wrist in torso frame: {ee_in_torso.translation}")
+    print(
+        f"  Target in torso frame:      "
+        f"[{target_forward:.4f}, {target_left:.4f}, {target_up:.4f}]"
+    )
+    print(f"  Target in world frame:      {target_world}")
+
+    if use_posture_bias:
+        print("  IK posture bias: ENABLED")
+        print(f"    posture_gain={posture_gain:.4f}")
+        print(
+            f"    weights: shoulder={shoulder_weight:.2f}, "
+            f"elbow={elbow_weight:.2f}, wrist={wrist_weight:.2f}"
+        )
+        print("    preferred ready posture:")
+        for name, value in zip(RIGHT_ARM_NAMES, preferred_ready_sdk_q):
+            print(f"      {name:<22} {value:+.4f}")
+    else:
+        print("  IK posture bias: disabled")
+
+    ok, q_sol, iters, pos_err = solve_position_ik(
+        model=model,
+        data=data,
+        frame_name=EE_FRAME,
+        q_init=q_ready,
+        q_nominal=q_nominal,
+        target_pos_world=target_world,
+        posture_gain=posture_gain,
+        posture_weights=posture_weights,
+    )
+
+    if not ok:
+        print(f"  IK FAILED after {iters} iterations, error = {pos_err:.6f} m")
+        return None
+
+    final_pose = fk(model, data, q_sol, EE_FRAME)
+    final_torso = torso_pose.actInv(final_pose)
+
+    print(f"  IK success in {iters} iterations, error = {pos_err:.6f} m")
+    print(f"  Solved wrist in torso frame: {final_torso.translation}")
+
+    result: Dict[str, float] = {}
+
+    for pin_name in CONTROL_JOINTS:
+        if pin_name in PIN_TO_SDK_NAME and model.existJointName(pin_name):
+            jid = model.getJointId(pin_name)
+            q_idx = model.joints[jid].idx_q
+            result[PIN_TO_SDK_NAME[pin_name]] = float(q_sol[q_idx])
+
+    return result
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dex3 helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Dex3RightHandController:
+    def __init__(
+        self,
+        cmd_topic: str,
+        state_topics: Sequence[str],
+        kp: float,
+        kd: float,
+        pressure_delta_threshold: float,
+    ):
+        from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_
+
+        self.cmd_topic = cmd_topic
+        self.state_topics = list(dict.fromkeys(state_topics))
+        self.kp = float(kp)
+        self.kd = float(kd)
+        self.pressure_delta_threshold = float(pressure_delta_threshold)
+
+        self.lock = threading.Lock()
+        self.state = None
+        self.first_state = False
+        self.state_topic_seen: Optional[str] = None
+        self.pressure_baseline: Optional[List[float]] = None
+        self.warned_pressure_parse = False
+
+        self.cmd = unitree_hg_msg_dds__HandCmd_()
+        self.pub = ChannelPublisher(self.cmd_topic, HandCmd_)
+        self.pub.Init()
+
+        self.subs = []
+        for topic in self.state_topics:
+            sub = ChannelSubscriber(topic, HandState_)
+            sub.Init(lambda msg, topic=topic: self._on_state(msg, topic), 10)
+            self.subs.append(sub)
+
+    def _on_state(self, msg, topic: str):
+        with self.lock:
+            self.state = msg
+            self.first_state = True
+            self.state_topic_seen = topic
+
+    def wait_for_state(self, timeout: float = 2.0) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.first_state:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def current_q(self) -> Optional[List[float]]:
+        with self.lock:
+            msg = self.state
+        if msg is None:
+            return None
+        try:
+            return [float(msg.motor_state[i].q) for i in range(7)]
+        except Exception:
+            return None
+
+    def _pressure_object_to_list(self, obj: Any) -> List[float]:
+        # The SDK generated type can vary; try common field names first.
+        for attr in ("pressure", "press", "value", "values", "data", "force"):
+            if hasattr(obj, attr):
+                val = getattr(obj, attr)
+                try:
+                    return [float(x) for x in val]
+                except TypeError:
+                    try:
+                        return [float(val)]
+                    except Exception:
+                        pass
+        try:
+            return [float(x) for x in obj]
+        except Exception:
+            return []
+
+    def pressure_flat(self) -> Optional[List[float]]:
+        with self.lock:
+            msg = self.state
+        if msg is None:
+            return None
+        try:
+            sensors = msg.press_sensor_state
+        except Exception:
+            return None
+        flat: List[float] = []
+        try:
+            for s in sensors:
+                flat.extend(self._pressure_object_to_list(s))
+        except Exception:
+            return None
+        return flat if flat else None
+
+    def capture_pressure_baseline(self) -> bool:
+        flat = self.pressure_flat()
+        if flat is None:
+            print("[dex3] Could not parse pressure baseline; pressure-stop disabled for this run.")
+            self.pressure_baseline = None
+            return False
+        self.pressure_baseline = flat
+        print(f"[dex3] Captured pressure baseline with {len(flat)} values.")
+        return True
+
+    def pressure_contact_detected(self) -> Tuple[bool, float]:
+        if self.pressure_baseline is None:
+            return False, 0.0
+        cur = self.pressure_flat()
+        if cur is None or len(cur) != len(self.pressure_baseline):
+            if not self.warned_pressure_parse:
+                print("[dex3] Pressure parse mismatch; cannot use pressure-stop right now.")
+                self.warned_pressure_parse = True
+            return False, 0.0
+        max_delta = max(abs(c - b) for c, b in zip(cur, self.pressure_baseline))
+        return max_delta >= self.pressure_delta_threshold, max_delta
+
+    def command_q(self, q7: Sequence[float], kp: Optional[float] = None, kd: Optional[float] = None):
+        if len(q7) != 7:
+            raise ValueError(f"Dex3 q command must have 7 values, got {len(q7)}")
+        kp = self.kp if kp is None else float(kp)
+        kd = self.kd if kd is None else float(kd)
+        if len(self.cmd.motor_cmd) < 7:
+            raise RuntimeError(
+                f"HandCmd_.motor_cmd has length {len(self.cmd.motor_cmd)}, expected at least 7. "
+                "Check your unitree_sdk2py HandCmd default object."
+            )
+        for i in range(7):
+            m = self.cmd.motor_cmd[i]
+            m.mode = dex3_mode(i, status=0x01, timeout=0)
+            m.q = float(q7[i])
+            m.dq = 0.0
+            m.tau = 0.0
+            m.kp = kp
+            m.kd = kd
+        self.pub.Write(self.cmd)
+
+    def stop_motors(self):
+        # Timeout bit set, gains zero. Mirrors official C++ stopMotors idea.
+        try:
+            for i in range(min(7, len(self.cmd.motor_cmd))):
+                m = self.cmd.motor_cmd[i]
+                m.mode = dex3_mode(i, status=0x01, timeout=1)
+                m.q = 0.0
+                m.dq = 0.0
+                m.tau = 0.0
+                m.kp = 0.0
+                m.kd = 0.0
+            self.pub.Write(self.cmd)
+        except Exception as exc:
+            print(f"[dex3] Failed to send stop_motors command: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SDK2 arm + optional Dex3 controller
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Controller:
+    def __init__(
+        self,
+        iface: str,
+        ready_q: List[float],
+        ik_target_q: Optional[List[float]],
+        per_joint_kp: List[float],
+        kp_hold: float,
+        kd: float,
+        weight_ramp_sec: float,
+        clearance_roll: float,
+        clearance_duration: float,
+        ready_duration: float,
+        ready_hold: float,
+        target_duration: float,
+        target_hold: float,
+        release_sec: float,
+        ik_gradual_step: float,
+        ready_only: bool,
+        log_errors: bool,
+        use_desk_clearance: bool,
+        desk_clearance_q: List[float],
+        desk_shoulder_duration: float,
+        desk_elbow_duration: float,
+        desk_exit_elbow_duration: float,
+        desk_exit_shoulder_duration: float,
+        use_dex3: bool,
+        hand_cmd_topic: str,
+        hand_state_topics: Sequence[str],
+        hand_open_at_ready: bool,
+        hand_close_at_target: bool,
+        hand_open_q: List[float],
+        hand_closed_q: Optional[List[float]],
+        hand_open_duration: float,
+        hand_close_duration: float,
+        hand_hold_after_close: float,
+        hand_kp: float,
+        hand_kd: float,
+        hand_pressure_stop: bool,
+        hand_pressure_delta_threshold: float,
+    ):
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+        from unitree_sdk2py.utils.crc import CRC
+        from unitree_sdk2py.utils.thread import RecurrentThread
+
+        self.iface = iface
+        self.ready_q = ready_q
+        self.ik_target_q = ik_target_q
+        self.per_joint_kp = per_joint_kp
+        self.kp_hold = kp_hold
+        self.kd = kd
+        self.weight_ramp_sec = weight_ramp_sec
+        self.clearance_roll = clearance_roll
+        self.clearance_duration = clearance_duration
+        self.ready_duration = ready_duration
+        self.ready_hold = ready_hold
+        self.target_duration = target_duration
+        self.target_hold = target_hold
+        self.release_sec = release_sec
+        self.ik_gradual_step = clamp01(ik_gradual_step)
+        self.ready_only = ready_only
+        self.log_errors = log_errors
+
+        self.use_desk_clearance = use_desk_clearance
+        self.desk_clearance_q = desk_clearance_q
+        self.desk_shoulder_duration = max(0.1, float(desk_shoulder_duration))
+        self.desk_elbow_duration = max(0.1, float(desk_elbow_duration))
+        self.desk_exit_elbow_duration = max(0.1, float(desk_exit_elbow_duration))
+        self.desk_exit_shoulder_duration = max(0.1, float(desk_exit_shoulder_duration))
+        self.release_hold_q: Optional[List[float]] = None
+
+        self.use_dex3 = use_dex3
+        self.hand_open_at_ready = hand_open_at_ready
+        self.hand_close_at_target = hand_close_at_target
+        self.hand_open_q = hand_open_q
+        self.hand_closed_q = hand_closed_q
+        self.hand_open_duration = max(0.1, float(hand_open_duration))
+        self.hand_close_duration = max(0.1, float(hand_close_duration))
+        self.hand_hold_after_close = max(0.0, float(hand_hold_after_close))
+        self.hand_pressure_stop = hand_pressure_stop
+
+        self.RecurrentThread = RecurrentThread
+        self.control_dt = 0.02
+        self.crc = CRC()
+        self.low_cmd = unitree_hg_msg_dds__LowCmd_()
+        self.low_state = None
+        self.first_state = False
+        self.lock = threading.Lock()
+
+        self.left_start_q = [0.0] * 7
+        self.right_start_q = [0.0] * 7
+        self.clearance_q = [0.0] * 7
+
+        self.ik_cmd_q = None
+        if ik_target_q is not None:
+            self.ik_cmd_q = [
+                ready_q[i] + self.ik_gradual_step * (ik_target_q[i] - ready_q[i])
+                for i in range(7)
+            ]
+
+        self.stage = "wait"
+        self.t_stage = 0.0
+        self.done = False
+        self.log_printed = False
+
+        self.ready_hand_started = False
+        self.ready_hand_start_t = 0.0
+        self.ready_hand_start_q: Optional[List[float]] = None
+        self.ready_pressure_baseline_done = False
+
+        self.target_hand_started = False
+        self.target_hand_start_t = 0.0
+        self.target_hand_start_q: Optional[List[float]] = None
+        self.target_hand_done = False
+        self.target_hand_hold_q: Optional[List[float]] = None
+        self.target_hand_contact = False
+        self.target_hand_contact_delta = 0.0
+
+        ChannelFactoryInitialize(0, self.iface)
+
+        self.pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
+        self.pub.Init()
+        self.sub = ChannelSubscriber("rt/lowstate", LowState_)
+        self.sub.Init(self._on_state, 10)
+
+        self.hand: Optional[Dex3RightHandController] = None
+        if self.use_dex3:
+            self.hand = Dex3RightHandController(
+                cmd_topic=hand_cmd_topic,
+                state_topics=hand_state_topics,
+                kp=hand_kp,
+                kd=hand_kd,
+                pressure_delta_threshold=hand_pressure_delta_threshold,
+            )
+
+    def _on_state(self, msg):
+        with self.lock:
+            self.low_state = msg
+            if not self.first_state:
+                self.first_state = True
+                self.left_start_q = [msg.motor_state[i].q for i in LEFT_ARM_INDICES]
+                self.right_start_q = [msg.motor_state[i].q for i in RIGHT_ARM_INDICES]
+                self.clearance_q = list(self.right_start_q)
+                self.clearance_q[1] = self.clearance_roll
+
+    def _set_motor(self, idx, q, kp, kd):
+        m = self.low_cmd.motor_cmd[idx]
+        m.mode = 1
+        m.q = float(q)
+        m.dq = 0.0
+        m.tau = 0.0
+        m.kp = float(kp)
+        m.kd = float(kd)
+
+    def _write_arms(self, right_q_7: Sequence[float]):
+        for i, idx in enumerate(LEFT_ARM_INDICES):
+            self._set_motor(idx, self.left_start_q[i], self.kp_hold, self.kd)
+        for i, idx in enumerate(RIGHT_ARM_INDICES):
+            self._set_motor(idx, right_q_7[i], self.per_joint_kp[i], self.kd)
+
+    def _blend(self, start_q: Sequence[float], end_q: Sequence[float], t_norm: float) -> List[float]:
+        t = clamp01(t_norm)
+        return [float(start_q[i]) + t * (float(end_q[i]) - float(start_q[i])) for i in range(7)]
+
+    def _desk_shoulder_q(self, base_q: Sequence[float]) -> List[float]:
+        # Move shoulder pitch/roll/yaw first, keep elbow/wrists unchanged.
+        q = list(base_q)
+        for i in (0, 1, 2):
+            q[i] = self.desk_clearance_q[i]
+        return q
+
+    def _desk_elbow_q(self, base_q: Sequence[float]) -> List[float]:
+        # Move elbow/wrists first, keep shoulder pose unchanged.
+        q = list(base_q)
+        for i in (3, 4, 5, 6):
+            q[i] = self.desk_clearance_q[i]
+        return q
+
+    def _publish(self):
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.pub.Write(self.low_cmd)
+
+    def _log_joint_errors(self, target_q: Sequence[float], stage_name: str):
+        with self.lock:
+            msg = self.low_state
+        if msg is None:
+            return
+        print(f"\n{'=' * 78}")
+        print(f" Joint errors during {stage_name}")
+        print(f"{'=' * 78}")
+        print(f"{'idx':>4}  {'name':<22}  {'target':>10}  {'actual':>10}  {'error':>10}  {'dq':>10}  {'kp':>6}")
+        max_err = 0.0
+        for i, idx in enumerate(RIGHT_ARM_INDICES):
+            actual = float(msg.motor_state[idx].q)
+            dq = float(msg.motor_state[idx].dq)
+            target = float(target_q[i])
+            err = actual - target
+            max_err = max(max_err, abs(err))
+            print(f"{idx:>4}  {RIGHT_ARM_NAMES[i]:<22}  {target:+10.4f}  {actual:+10.4f}  {err:+10.4f}  {dq:+10.4f}  {self.per_joint_kp[i]:6.1f}")
+        print(f" Max |error| = {max_err:.4f} rad ({max_err * 57.3:.1f} deg)")
+        print(f"{'=' * 78}\n")
+
+    def _log_hand_state(self, label: str):
+        if self.hand is None:
+            return
+        q = self.hand.current_q()
+        if q is None:
+            print(f"[dex3:{label}] no hand state yet")
+            return
+        print(f"\n[dex3:{label}] current right hand q")
+        for name, val in zip(RIGHT_HAND_NAMES, q):
+            print(f"  {name:<18} {val:+.4f}")
+
+    def _update_hand_open_at_ready(self, now: float):
+        if self.hand is None or not self.hand_open_at_ready:
+            return
+        if not self.ready_hand_started:
+            self.ready_hand_started = True
+            self.ready_hand_start_t = now
+            self.ready_hand_start_q = self.hand.current_q() or list(self.hand_open_q)
+            print("[dex3] Opening right hand at READY.")
+            self._log_hand_state("before_open")
+
+        t = clamp01((now - self.ready_hand_start_t) / self.hand_open_duration)
+        q = self._blend(self.ready_hand_start_q, self.hand_open_q, t)
+        self.hand.command_q(q)
+
+        if t >= 1.0 and not self.ready_pressure_baseline_done:
+            self.ready_pressure_baseline_done = True
+            self.hand.capture_pressure_baseline()
+            self._log_hand_state("open_ready")
+
+    def _update_hand_close_at_target(self, now: float):
+        if self.hand is None or not self.hand_close_at_target:
+            return
+        if self.hand_closed_q is None:
+            return
+        if self.target_hand_done:
+            if self.target_hand_hold_q is not None:
+                self.hand.command_q(self.target_hand_hold_q)
+            return
+        if not self.target_hand_started:
+            self.target_hand_started = True
+            self.target_hand_start_t = now
+            self.target_hand_start_q = self.hand.current_q() or list(self.hand_open_q)
+            print("[dex3] Closing right hand at IK target.")
+            self._log_hand_state("before_close")
+
+        t = clamp01((now - self.target_hand_start_t) / self.hand_close_duration)
+        q = self._blend(self.target_hand_start_q, self.hand_closed_q, t)
+        self.hand.command_q(q)
+
+        if self.hand_pressure_stop:
+            contact, max_delta = self.hand.pressure_contact_detected()
+            if contact:
+                self.target_hand_done = True
+                self.target_hand_contact = True
+                self.target_hand_contact_delta = max_delta
+                self.target_hand_hold_q = self.hand.current_q() or q
+                print(f"[dex3] Pressure contact detected. Stopping close. max_delta={max_delta:.1f}")
+                self._log_hand_state("contact_stop")
+                return
+
+        if t >= 1.0:
+            self.target_hand_done = True
+            self.target_hand_hold_q = list(self.hand_closed_q)
+            print("[dex3] Close target reached without pressure stop.")
+            self._log_hand_state("closed_target")
+
+    def start(self):
+        print("Waiting for rt/lowstate ...")
+        while not self.first_state:
+            time.sleep(0.05)
+
+        if self.hand is not None:
+            ok = self.hand.wait_for_state(timeout=2.0)
+            if ok:
+                print(f"[dex3] Got right hand state from: {self.hand.state_topic_seen}")
+            else:
+                print("[dex3] WARNING: no right hand state yet. Commands may still publish, but pressure/current-q may be unavailable.")
+
+        print("Got lowstate. Right arm current q:")
+        for i, name in enumerate(RIGHT_ARM_NAMES):
+            print(f"  [{RIGHT_ARM_INDICES[i]}] {name:<22} = {self.right_start_q[i]:+.4f}")
+
+        input("\nReview plan above. Press Enter to begin (Ctrl-C aborts)... ")
+        self.stage = "weight_up"
+        self.t_stage = time.time()
+        self.thread = self.RecurrentThread(interval=self.control_dt, target=self._tick, name="g1_ik_ready_then_target_dex3")
+        self.thread.Start()
+
+    def _tick(self):
+        if self.done:
+            return
+        now = time.time()
+
+        if self.stage == "weight_up":
+            r = clamp01((now - self.t_stage) / self.weight_ramp_sec)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = r
+            self._write_arms(self.right_start_q)
+            self._publish()
+            if r >= 1.0:
+                self.stage = "move_clearance"
+                self.t_stage = now
+                print("[stage] weight=1.0, swinging roll outward for clearance")
+
+        elif self.stage == "move_clearance":
+            t_norm = clamp01((now - self.t_stage) / self.clearance_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            q = self._blend(self.right_start_q, self.clearance_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                if self.use_desk_clearance:
+                    self.stage = "move_desk_shoulder_in"
+                    self.t_stage = now
+                    print("[stage] clearance reached, moving shoulder to desk-clearance pose")
+                else:
+                    self.stage = "move_ready"
+                    self.t_stage = now
+                    print("[stage] clearance reached, moving to READY")
+
+        elif self.stage == "move_desk_shoulder_in":
+            # Approach safety: move shoulder pitch/roll/yaw first while elbow/wrists stay tucked/current.
+            t_norm = clamp01((now - self.t_stage) / self.desk_shoulder_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            shoulder_q = self._desk_shoulder_q(self.clearance_q)
+            q = self._blend(self.clearance_q, shoulder_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.stage = "move_desk_elbow_in"
+                self.t_stage = now
+                print("[stage] desk shoulder reached, bending elbow/wrist to desk-clearance pose")
+
+        elif self.stage == "move_desk_elbow_in":
+            # Approach safety: once shoulder is back/out, bend elbow upward / tuck wrist before going to READY.
+            t_norm = clamp01((now - self.t_stage) / self.desk_elbow_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            shoulder_q = self._desk_shoulder_q(self.clearance_q)
+            q = self._blend(shoulder_q, self.desk_clearance_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.stage = "move_ready"
+                self.t_stage = now
+                print("[stage] desk-clearance pose reached, moving to READY")
+
+        elif self.stage == "move_ready":
+            t_norm = clamp01((now - self.t_stage) / self.ready_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            ready_start_q = self.desk_clearance_q if self.use_desk_clearance else self.clearance_q
+            q = self._blend(ready_start_q, self.ready_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.stage = "hold_ready"
+                self.t_stage = now
+                self.log_printed = False
+                self.ready_hand_started = False
+                self.ready_pressure_baseline_done = False
+                print("[stage] READY reached, holding")
+
+        elif self.stage == "hold_ready":
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            self._write_arms(self.ready_q)
+            self._publish()
+            self._update_hand_open_at_ready(now)
+            if self.log_errors and not self.log_printed and (now - self.t_stage) >= min(1.0, self.ready_hold * 0.5):
+                self._log_joint_errors(self.ready_q, "READY hold")
+                self.log_printed = True
+            if (now - self.t_stage) >= self.ready_hold:
+                if self.ready_only or self.ik_cmd_q is None:
+                    self.stage = "release"
+                    self.t_stage = now
+                    print("[stage] ready-only, releasing")
+                else:
+                    self.stage = "move_target"
+                    self.t_stage = now
+                    self.log_printed = False
+                    print("[stage] moving READY → IK target")
+
+        elif self.stage == "move_target":
+            t_norm = clamp01((now - self.t_stage) / self.target_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            q = self._blend(self.ready_q, self.ik_cmd_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.stage = "hold_target"
+                self.t_stage = now
+                self.log_printed = False
+                self.target_hand_started = False
+                self.target_hand_done = False
+                self.target_hand_hold_q = None
+                print("[stage] IK target reached, holding")
+
+        elif self.stage == "hold_target":
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            self._write_arms(self.ik_cmd_q)
+            self._publish()
+            self._update_hand_close_at_target(now)
+            if self.log_errors and not self.log_printed and (now - self.t_stage) >= min(1.0, self.target_hold * 0.5):
+                self._log_joint_errors(self.ik_cmd_q, "IK target hold")
+                self.log_printed = True
+            # Hold at least target_hold; if closing, also give optional post-close hold.
+            hand_extra_done = True
+            if self.hand_close_at_target and self.hand is not None:
+                if not self.target_hand_done:
+                    hand_extra_done = False
+                elif (now - self.target_hand_start_t) < (self.hand_close_duration + self.hand_hold_after_close):
+                    hand_extra_done = False
+            if (now - self.t_stage) >= self.target_hold and hand_extra_done:
+                if self.use_desk_clearance:
+                    self.stage = "move_exit_elbow_up"
+                    self.t_stage = now
+                    print("[stage] hold done, bending elbow/wrist up for desk exit")
+                else:
+                    self.release_hold_q = list(self.ik_cmd_q)
+                    self.stage = "release"
+                    self.t_stage = now
+                    print("[stage] hold done, releasing")
+
+        elif self.stage == "move_exit_elbow_up":
+            # Exit safety: from IK target, bend elbow/wrists up first while shoulder stays at target.
+            t_norm = clamp01((now - self.t_stage) / self.desk_exit_elbow_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            start_q = self.ik_cmd_q if self.ik_cmd_q is not None else self.ready_q
+            elbow_up_q = self._desk_elbow_q(start_q)
+            q = self._blend(start_q, elbow_up_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.stage = "move_exit_shoulder_back"
+                self.t_stage = now
+                print("[stage] elbow/wrist clear, moving shoulder back/out for desk exit")
+
+        elif self.stage == "move_exit_shoulder_back":
+            # Exit safety: after elbow is up/tucked, move shoulder to desk-clearance pose.
+            t_norm = clamp01((now - self.t_stage) / self.desk_exit_shoulder_duration)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0
+            start_q = self.ik_cmd_q if self.ik_cmd_q is not None else self.ready_q
+            elbow_up_q = self._desk_elbow_q(start_q)
+            q = self._blend(elbow_up_q, self.desk_clearance_q, t_norm)
+            self._write_arms(q)
+            self._publish()
+            if t_norm >= 1.0:
+                self.release_hold_q = list(self.desk_clearance_q)
+                self.stage = "release"
+                self.t_stage = now
+                print("[stage] desk-exit clearance reached, releasing arm_sdk")
+
+        elif self.stage == "release":
+            r = clamp01((now - self.t_stage) / self.release_sec)
+            self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 1.0 - r
+            last_q = self.release_hold_q or (self.ik_cmd_q if (self.ik_cmd_q is not None and not self.ready_only) else self.ready_q)
+            self._write_arms(last_q)
+            self._publish()
+            # Keep holding hand command during arm release; do not start any new hand motion.
+            if self.hand is not None:
+                if self.hand_close_at_target and self.target_hand_hold_q is not None:
+                    self.hand.command_q(self.target_hand_hold_q)
+                elif self.hand_open_at_ready:
+                    self.hand.command_q(self.hand_open_q)
+            if r >= 1.0:
+                print("[stage] arm_sdk released. Done.")
+                self.done = True
+
+    def emergency_release(self):
+        print("[INTERRUPTED] Attempting to release arm_sdk weight...")
+        try:
+            for _ in range(50):
+                self.low_cmd.motor_cmd[WEIGHT_SLOT].q = 0.0
+                self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+                self.pub.Write(self.low_cmd)
+                time.sleep(0.02)
+            print("  Arm weight set to 0. Press L2+B if anything looks wrong.")
+        except Exception as exc:
+            print(f"  Failed to release arm cleanly: {exc}")
+            print("  PRESS L2+B NOW for emergency damping.")
+        if self.hand is not None:
+            self.hand.stop_motors()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI and main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def subscribe_target_once(topic: str, timeout_sec: float, settling_sec: float):
+    """
+    Spin rclpy until we receive a PointStamped on `topic`, then optionally wait
+    `settling_sec` more so we lock in the most recent value (the perception node
+    typically publishes ~5-10 Hz, the first message can be slightly stale).
+
+    Returns (frame_id, [x, y, z]) or None on timeout.
+    """
+    if not HAVE_ROS2:
+        print("[subscribe] ERROR: rclpy not importable. Source your ROS2 setup first:")
+        print("  source ~/unitree_ros2/setup.sh")
+        print("  source ~/ros2_ws/install/setup.bash   # if applicable")
+        return None
+
+    rclpy.init()
+    node = _RclpyNode("g1_ik_target_subscriber")
+
+    state = {"msg": None}
+
+    def cb(msg: PointStamped):
+        state["msg"] = msg
+
+    node.create_subscription(PointStamped, topic, cb, 10)
+
+    print(f"[subscribe] Waiting for first message on {topic} (timeout {timeout_sec:.1f}s)...")
+    t0 = time.time()
+    while state["msg"] is None and (time.time() - t0) < timeout_sec:
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+    if state["msg"] is None:
+        print(f"[subscribe] No message received within {timeout_sec:.1f}s.")
+        node.destroy_node()
+        rclpy.shutdown()
+        return None
+
+    if settling_sec > 0:
+        print(f"[subscribe] Got a message. Settling for {settling_sec:.2f}s to grab the latest value...")
+        t_end = time.time() + settling_sec
+        while time.time() < t_end:
+            rclpy.spin_once(node, timeout_sec=0.05)
+
+    msg = state["msg"]
+    out = (msg.header.frame_id, [float(msg.point.x), float(msg.point.y), float(msg.point.z)])
+
+    node.destroy_node()
+    rclpy.shutdown()
+    return out
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="G1 IK Ready-Then-Target + optional Dex3 right hand")
+
+    p.add_argument("--target-forward", type=float, default=0.12)
+    p.add_argument("--target-left", type=float, default=-0.18)
+    p.add_argument("--target-up", type=float, default=0.00)
+
+    # Subscribe-target mode: replaces --target-forward/-left/-up with the
+    # point from /right_pregrasp_torso_point. Manual CLI mode still works
+    # exactly as before when this flag is not set.
+    p.add_argument("--subscribe-target", action="store_true",
+                   help="Subscribe to a torso-frame PointStamped and use it as the IK target")
+    p.add_argument("--target-topic", default="/right_pregrasp_torso_point",
+                   help="ROS2 topic publishing a torso-frame PointStamped")
+    p.add_argument("--subscribe-timeout", type=float, default=30.0,
+                   help="Seconds to wait for the first message")
+    p.add_argument("--subscribe-settling", type=float, default=1.0,
+                   help="Seconds to keep spinning after first message to lock in the latest value")
+
+    # Preserve the existing script's defaults unless user overrides them.
+    # READY pose: arm abducted out to the right, internally rotated, so the
+    # hand sits to the RIGHT of where typical bottle/object targets are.
+    # Opening the fingers at READY won't swipe the object; the move-to-target
+    # stage swings the hand inward (toward body) to grasp.
+    # Override any of these via CLI if the pose needs tweaking. The same
+    # values are also fed into the IK posture bias (so the IK solution prefers
+    # to stay shaped like this READY).
+    p.add_argument("--ready-shoulder-pitch", type=float, default=-0.20)
+    p.add_argument("--ready-shoulder-roll", type=float, default=-0.25)
+    p.add_argument("--ready-shoulder-yaw", type=float, default=-1.02)
+    p.add_argument("--ready-elbow", type=float, default=-0.11)
+    p.add_argument("--ready-wrist-roll", type=float, default=+0.07)
+    p.add_argument("--ready-wrist-pitch", type=float, default=+0.18)
+    p.add_argument("--ready-wrist-yaw", type=float, default=-0.04)
+
+    # Optional desk/table clearance path. Disabled by default so old behavior is preserved.
+    # If enabled: current -> roll clearance -> shoulder-back desk pose -> elbow-up desk pose -> READY,
+    # and after IK: elbow-up -> shoulder-back desk pose -> release.
+    p.add_argument("--use-desk-clearance", action="store_true")
+    p.add_argument("--desk-clearance-shoulder-pitch", type=float, default=DEFAULT_DESK_CLEARANCE_Q[0])
+    p.add_argument("--desk-clearance-shoulder-roll", type=float, default=DEFAULT_DESK_CLEARANCE_Q[1])
+    p.add_argument("--desk-clearance-shoulder-yaw", type=float, default=DEFAULT_DESK_CLEARANCE_Q[2])
+    p.add_argument("--desk-clearance-elbow", type=float, default=DEFAULT_DESK_CLEARANCE_Q[3])
+    p.add_argument("--desk-clearance-wrist-roll", type=float, default=DEFAULT_DESK_CLEARANCE_Q[4])
+    p.add_argument("--desk-clearance-wrist-pitch", type=float, default=DEFAULT_DESK_CLEARANCE_Q[5])
+    p.add_argument("--desk-clearance-wrist-yaw", type=float, default=DEFAULT_DESK_CLEARANCE_Q[6])
+    p.add_argument("--desk-shoulder-duration", type=float, default=3.0)
+    p.add_argument("--desk-elbow-duration", type=float, default=3.0)
+    p.add_argument("--desk-exit-elbow-duration", type=float, default=3.0)
+    p.add_argument("--desk-exit-shoulder-duration", type=float, default=3.0)
+
+    p.add_argument("--safe-shoulder-roll", type=float, default=-0.30)
+    p.add_argument("--force-safe-shoulder-roll", action="store_true")
+    p.add_argument("--ik-gradual-step", type=float, default=1.0)
+
+    # Optional Pinocchio posture bias. This makes IK prefer the original
+    # good READY shoulder/elbow shape instead of reaching with weird geometry.
+    p.add_argument("--ik-posture-bias", action="store_true")
+    p.add_argument("--ik-posture-gain", type=float, default=0.08)
+    p.add_argument("--ik-shoulder-weight", type=float, default=3.0)
+    p.add_argument("--ik-elbow-weight", type=float, default=3.0)
+    p.add_argument("--ik-wrist-weight", type=float, default=0.2)
+
+    p.add_argument("--ws-min-forward", type=float, default=0.05)
+    p.add_argument("--ws-max-forward", type=float, default=0.40)
+    p.add_argument("--ws-min-left", type=float, default=-0.40)
+    p.add_argument("--ws-max-left", type=float, default=0.15)
+    p.add_argument("--ws-min-up", type=float, default=0.00)
+    p.add_argument("--ws-max-up", type=float, default=0.60)
+
+    p.add_argument("--kp-test", type=float, default=35.0)
+    p.add_argument("--right-shoulder-roll-kp", type=float, default=45.0)
+    p.add_argument("--right-elbow-kp", type=float, default=65.0)
+    p.add_argument("--kp-hold", type=float, default=40.0)
+    p.add_argument("--kd", type=float, default=1.5)
+
+    p.add_argument("--weight-ramp", type=float, default=1.5)
+    p.add_argument("--clearance-duration", type=float, default=3.0)
+    p.add_argument("--ready-duration", type=float, default=8.0)
+    p.add_argument("--ready-hold", type=float, default=3.0)
+    p.add_argument("--target-duration", type=float, default=10.0)
+    p.add_argument("--target-hold", type=float, default=8.0)
+    p.add_argument("--release", type=float, default=2.0)
+
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--ready-only", action="store_true")
+    p.add_argument("--log-errors", action="store_true")
+    p.add_argument("--iface", default="enx00e04c7015d3")
+
+    # Dex3 options. Closing is disabled unless --hand-close-at-target and --hand-closed-q are provided.
+    p.add_argument("--use-dex3", action="store_true")
+    p.add_argument("--hand-open-at-ready", action="store_true")
+    p.add_argument("--hand-close-at-target", action="store_true")
+    p.add_argument("--hand-cmd-topic", default="rt/dex3/right/cmd")
+    p.add_argument(
+        "--hand-state-topic",
+        default="auto",
+        help="Use 'auto' to subscribe to both rt/dex3/right/state and rt/lf/dex3/right/state",
+    )
+    p.add_argument("--hand-open-q", default=format_q7(RIGHT_HAND_OPEN_Q))
+    p.add_argument("--hand-closed-q", default=None)
+    p.add_argument("--hand-open-duration", type=float, default=2.0)
+    p.add_argument("--hand-close-duration", type=float, default=4.0)
+    p.add_argument("--hand-hold-after-close", type=float, default=2.0)
+    p.add_argument("--hand-kp", type=float, default=0.8)
+    p.add_argument("--hand-kd", type=float, default=0.1)
+    p.add_argument("--hand-pressure-stop", action="store_true")
+    p.add_argument("--hand-pressure-delta-threshold", type=float, default=3000.0)
+
+    args = p.parse_args()
+    args.hand_open_q_list = parse_q7_csv(args.hand_open_q, "--hand-open-q")
+    args.hand_closed_q_list = None
+    if args.hand_closed_q is not None:
+        args.hand_closed_q_list = parse_q7_csv(args.hand_closed_q, "--hand-closed-q")
+    if args.hand_close_at_target and args.hand_closed_q_list is None:
+        p.error("--hand-close-at-target requires --hand-closed-q. Do not invent closed values; record/provide them first.")
+    if (args.hand_open_at_ready or args.hand_close_at_target) and not args.use_dex3:
+        args.use_dex3 = True
+    return args
+
+
+def workspace_check(args) -> List[str]:
+    fwd, lft, up = args.target_forward, args.target_left, args.target_up
+    rejected = []
+    if fwd < args.ws_min_forward:
+        rejected.append(f"forward {fwd:+.3f} < min {args.ws_min_forward:+.3f}")
+    if fwd > args.ws_max_forward:
+        rejected.append(f"forward {fwd:+.3f} > max {args.ws_max_forward:+.3f}")
+    if lft > args.ws_max_left:
+        rejected.append(f"left {lft:+.3f} > max {args.ws_max_left:+.3f} (too far left / wrong side for right arm)")
+    if lft < args.ws_min_left:
+        rejected.append(f"left {lft:+.3f} < min {args.ws_min_left:+.3f} (too far right)")
+    if up < args.ws_min_up:
+        rejected.append(f"up {up:+.3f} < min {args.ws_min_up:+.3f}")
+    if up > args.ws_max_up:
+        rejected.append(f"up {up:+.3f} > max {args.ws_max_up:+.3f}")
+    return rejected
+
+
+def main():
+    args = parse_args()
+    print("=" * 78)
+    print(" G1 IK READY-THEN-TARGET + OPTIONAL DEX3")
+    print("=" * 78)
+
+    if args.subscribe_target:
+        print("=" * 78)
+        print(" SUBSCRIBING TO ROS2 TARGET TOPIC")
+        print("=" * 78)
+        result = subscribe_target_once(
+            args.target_topic,
+            args.subscribe_timeout,
+            args.subscribe_settling,
+        )
+        if result is None:
+            print("Aborting: no target received from perception pipeline.")
+            sys.exit(1)
+        frame_id, (x, y, z) = result
+        if frame_id != TORSO_FRAME:
+            print(f"\n[subscribe] WARNING: expected frame '{TORSO_FRAME}' but got '{frame_id}'.")
+            print( "[subscribe]          The publisher should already be in torso_link.")
+            print( "[subscribe]          Aborting to be safe; check pca_obb_to_torso_pregrasp.py.")
+            sys.exit(1)
+        print(f"[subscribe] Locked target from {args.target_topic} (frame={frame_id}):")
+        print(f"           forward = {x:+.4f}")
+        print(f"           left    = {y:+.4f}")
+        print(f"           up      = {z:+.4f}")
+        args.target_forward = x
+        args.target_left = y
+        args.target_up = z
+
+    rejected = workspace_check(args)
+    if rejected:
+        print("\n[WORKSPACE REJECT] Target outside safe workspace:")
+        for r in rejected:
+            print(f"  - {r}")
+        print("Override workspace args only if you are sure.")
+        sys.exit(1)
+    print("Workspace check: PASSED")
+
+    # Build the SDK-order READY q first so we can both send it to the
+    # controller AND feed it to the IK posture bias as the preferred shape.
+    ready_q = [
+        args.ready_shoulder_pitch,
+        args.ready_shoulder_roll,
+        args.ready_shoulder_yaw,
+        args.ready_elbow,
+        args.ready_wrist_roll,
+        args.ready_wrist_pitch,
+        args.ready_wrist_yaw,
+    ]
+
+    print("\n[2] Solving Pinocchio IK...")
+    print(f"  Target (torso frame): forward={args.target_forward}, left={args.target_left}, up={args.target_up}")
+    ik_result = solve_ik_for_target(
+        args.target_forward,
+        args.target_left,
+        args.target_up,
+        use_posture_bias=args.ik_posture_bias,
+        posture_gain=args.ik_posture_gain,
+        shoulder_weight=args.ik_shoulder_weight,
+        elbow_weight=args.ik_elbow_weight,
+        wrist_weight=args.ik_wrist_weight,
+        preferred_ready_sdk_q=ready_q,
+    )
+    if ik_result is None:
+        sys.exit(1)
+
+    print("\nIK solution raw:")
+    for name in RIGHT_ARM_NAMES:
+        print(f"  {name:<22} = {ik_result[name]:+.5f}")
+
+    if args.force_safe_shoulder_roll:
+        raw_roll = ik_result["right_shoulder_roll"]
+        if raw_roll > args.safe_shoulder_roll:
+            print(f"\n[SAFETY] IK shoulder_roll {raw_roll:+.5f} is less outward than {args.safe_shoulder_roll:+.5f}; clamping.")
+            ik_result["right_shoulder_roll"] = args.safe_shoulder_roll
+
+    desk_clearance_q = [
+        args.desk_clearance_shoulder_pitch,
+        args.desk_clearance_shoulder_roll,
+        args.desk_clearance_shoulder_yaw,
+        args.desk_clearance_elbow,
+        args.desk_clearance_wrist_roll,
+        args.desk_clearance_wrist_pitch,
+        args.desk_clearance_wrist_yaw,
+    ]
+    ik_q = [ik_result[name] for name in RIGHT_ARM_NAMES]
+    gs = clamp01(args.ik_gradual_step)
+    ik_cmd_q = [ready_q[i] + gs * (ik_q[i] - ready_q[i]) for i in range(7)]
+
+    per_joint_kp = [args.kp_test] * 7
+    per_joint_kp[1] = args.right_shoulder_roll_kp
+    per_joint_kp[3] = args.right_elbow_kp
+
+    state_topics = [args.hand_state_topic]
+    if args.hand_state_topic == "auto":
+        state_topics = ["rt/dex3/right/state", "rt/lf/dex3/right/state"]
+
+    rest_approx = [+0.288, -0.136, +0.004, +0.970, -0.123, +0.040, -0.009]
+    print(f"\n{'=' * 78}")
+    print(" EXECUTION PLAN")
+    print(f"{'=' * 78}")
+    print(f"Mode             : {'DRY RUN' if args.dry_run else ('READY ONLY' if args.ready_only else 'READY → IK')}")
+    print(f"IK gradual step  : {gs:.2f}")
+    print(f"IK posture bias  : {args.ik_posture_bias}")
+    if args.ik_posture_bias:
+        print(f"  posture gain   : {args.ik_posture_gain}")
+        print(f"  weights        : shoulder={args.ik_shoulder_weight}, elbow={args.ik_elbow_weight}, wrist={args.ik_wrist_weight}")
+    print(f"Desk clearance   : {args.use_desk_clearance}")
+    if args.use_desk_clearance:
+        print(f"  desk q         : {format_q7(desk_clearance_q)}")
+        print(f"  approach       : shoulder first {args.desk_shoulder_duration}s, then elbow/wrist {args.desk_elbow_duration}s")
+        print(f"  exit           : elbow/wrist first {args.desk_exit_elbow_duration}s, then shoulder {args.desk_exit_shoulder_duration}s")
+    print(f"Dex3 enabled     : {args.use_dex3}")
+    if args.use_dex3:
+        print(f"  open at READY  : {args.hand_open_at_ready}")
+        print(f"  close at target: {args.hand_close_at_target}")
+        print(f"  cmd topic      : {args.hand_cmd_topic}")
+        print(f"  state topics   : {state_topics}")
+        print(f"  open q         : {format_q7(args.hand_open_q_list)}")
+        print(f"  closed q       : {format_q7(args.hand_closed_q_list) if args.hand_closed_q_list else 'NOT PROVIDED / closing disabled'}")
+        print(f"  pressure stop  : {args.hand_pressure_stop}, delta threshold={args.hand_pressure_delta_threshold}")
+
+    print(f"\n{'joint':<22} {'~rest':>10} {'desk':>10} {'ready':>10} {'IK raw':>10} {'IK cmd':>10} {'kp':>7}")
+    for i, name in enumerate(RIGHT_ARM_NAMES):
+        print(f"{name:<22} {rest_approx[i]:+10.4f} {desk_clearance_q[i]:+10.4f} {ready_q[i]:+10.4f} {ik_q[i]:+10.4f} {ik_cmd_q[i]:+10.4f} {per_joint_kp[i]:7.1f}")
+    print(f"{'=' * 78}")
+
+    # First confirmation gate: review the printed plan BEFORE we even connect
+    # to SDK2. Applies to both dry-run and real-run. For real-run, the
+    # controller's start() will ask again after live state is read.
+    try:
+        if args.dry_run:
+            input("\nReview plan above. Press Enter to acknowledge DRY RUN (Ctrl-C aborts)... ")
+        else:
+            input("\nReview plan above. Press Enter to connect to the robot (Ctrl-C aborts)... ")
+    except KeyboardInterrupt:
+        print("\nAborted before any robot connection.")
+        sys.exit(0)
+
+    if args.dry_run:
+        print("\nDRY RUN complete. No robot or Dex3 connection made.")
+        return
+
+    print("\n[7] Connecting to robot via SDK2...")
+    print("Robot must be in Regular Mode (R1+X). Keep hand near L2+B.")
+
+    ctrl = Controller(
+        iface=args.iface,
+        ready_q=ready_q,
+        ik_target_q=ik_q if not args.ready_only else None,
+        per_joint_kp=per_joint_kp,
+        kp_hold=args.kp_hold,
+        kd=args.kd,
+        weight_ramp_sec=args.weight_ramp,
+        clearance_roll=args.safe_shoulder_roll,
+        clearance_duration=args.clearance_duration,
+        ready_duration=args.ready_duration,
+        ready_hold=args.ready_hold,
+        target_duration=args.target_duration,
+        target_hold=args.target_hold,
+        release_sec=args.release,
+        ik_gradual_step=args.ik_gradual_step,
+        ready_only=args.ready_only,
+        log_errors=args.log_errors,
+        use_desk_clearance=args.use_desk_clearance,
+        desk_clearance_q=desk_clearance_q,
+        desk_shoulder_duration=args.desk_shoulder_duration,
+        desk_elbow_duration=args.desk_elbow_duration,
+        desk_exit_elbow_duration=args.desk_exit_elbow_duration,
+        desk_exit_shoulder_duration=args.desk_exit_shoulder_duration,
+        use_dex3=args.use_dex3,
+        hand_cmd_topic=args.hand_cmd_topic,
+        hand_state_topics=state_topics,
+        hand_open_at_ready=args.hand_open_at_ready,
+        hand_close_at_target=args.hand_close_at_target,
+        hand_open_q=args.hand_open_q_list,
+        hand_closed_q=args.hand_closed_q_list,
+        hand_open_duration=args.hand_open_duration,
+        hand_close_duration=args.hand_close_duration,
+        hand_hold_after_close=args.hand_hold_after_close,
+        hand_kp=args.hand_kp,
+        hand_kd=args.hand_kd,
+        hand_pressure_stop=args.hand_pressure_stop,
+        hand_pressure_delta_threshold=args.hand_pressure_delta_threshold,
+    )
+    ctrl.start()
+    try:
+        while not ctrl.done:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        ctrl.emergency_release()
+
+
+if __name__ == "__main__":
+    main()
